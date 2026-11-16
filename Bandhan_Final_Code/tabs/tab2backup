@@ -1,0 +1,4776 @@
+from __future__ import annotations
+
+"""
+combined_fund_page_notes_gui.py
+
+Combined PyQt6 GUI with two independently-run sections.
+
+UPDATED SECTION ORDER:
+SECTION 1 - Age-Based Fund Page Notes Updater
+- Select one PPTX file.
+- Updates only the selected PPTX file.
+- Source-folder detection and Detected PPT Files list are removed from the UI.
+- Appends age-based notes to backend-fixed NotesBox.
+- If NotesBox is missing, creates it dynamically below SectorAllocation with 0.5 cm gap.
+
+SECTION 2 - Manual Fund Page Note
+- Manual mapping: Scheme Name + PPT Object Name + Note Text
+- Replaces text inside specific PPT object names.
+- If target textbox is missing, creates it dynamically below SectorAllocation with 0.5 cm gap.
+
+Install:
+    pip install PyQt6 python-pptx pandas openpyxl
+
+Run:
+    python combined_fund_page_notes_gui.py
+"""
+
+import html
+import re
+import sys
+import traceback
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any, Callable
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+from openpyxl import load_workbook
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.util import Cm, Pt
+
+from PyQt6.QtCore import QObject, QRunnable, QThreadPool, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtWidgets import (
+    QApplication,
+    QAbstractItemView,
+    QFileDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_TITLE = "Combined Fund Page Notes GUI"
+NOTE_FONT_NAME = "Ubuntu"
+NOTE_FONT_SIZE_PT = 6
+NOTE_FONT_SIZE = Pt(6)
+NOTES_BOX_DEFAULT = "NotesBox"
+SECTOR_ALLOCATION_OBJECT_NAME = "SectorAllocation"
+TEXTBOX_GAP_BELOW_SECTOR_CM = 0.5
+DYNAMIC_NOTES_BOX_HEIGHT_CM = 1.2
+KNOWN_HTML_TAGS = {"sup", "sub", "b", "strong", "i", "em", "u", "br", "p", "div"}
+
+# Section 1 detection groups. "updated" is optional.
+AGE_PPT_DETECTION_GROUPS = [
+    ("Equity", ["equity", "equityupdated"]),
+    ("Debt", ["debt", "debtupdated"]),
+    ("Hybrid", ["hybrid", "hybridupdated"]),
+    ("Equity Passive", ["equitypassive", "equitypassiveupdated", "equityupdatedpassive"]),
+    ("Debt Passive", ["debtpassive", "debtpassiveupdated", "debtupdatedpassive"]),
+]
+
+DEFAULT_FUND_PAGE_NOTE = (
+    "Sector allocation is rebased to 100%. "
+    "BSE 200 index is relatively considered suitable to compare sector allocation"
+)
+SHORT_TIMEFRAME_NOTE = (
+    "Portfolio Beta, Standard Deviation, R Squared, Sharpe Ratio and Tracking Error "
+    "of the Scheme is not computed owing to the short time frame (&lt;3years) since launch of the Scheme."
+)
+PORTFOLIO_TURNOVER_NOTE = (
+    "^Portfolio Turnover ratio is calculated as Lower of purchase or sale during the period / "
+    "Average AUM for the last one year (includes Fixed Income securities and Equity derivatives)."
+)
+ONE_TO_FIVE_YEAR_NOTE = "The scheme has been in existence for more than 1 year but less than 3 years or 5 years."
+LAUNCH_DATE_LABELS = ["launch date", "inception date", "date of allotment", "allotment date"]
+
+
+def previous_month_end(reference_date: date | None = None) -> date:
+    reference_date = reference_date or date.today()
+    return reference_date.replace(day=1) - timedelta(days=1)
+
+
+@dataclass
+class FundPageNote:
+    scheme: str
+    shape_name: str
+    note: str
+    source: str = "Manual"
+    use: bool = True
+
+
+def default_fund_page_notes() -> list[FundPageNote]:
+    return [
+        FundPageNote("Bandhan Balanced Advantage Fund", "TextBox 5", DEFAULT_FUND_PAGE_NOTE),
+        FundPageNote("Bandhan Retirement Fund", "TextBox 4", DEFAULT_FUND_PAGE_NOTE),
+    ]
+
+
+class WorkerSignals(QObject):
+    started = pyqtSignal()
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+
+class FunctionWorker(QRunnable):
+    def __init__(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
+        super().__init__()
+        self.func = func
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        self.signals.started.emit()
+        try:
+            if hasattr(self.func, "__code__") and "progress_cb" in self.func.__code__.co_varnames and "progress_cb" not in self.kwargs:
+                self.kwargs["progress_cb"] = self.signals.progress.emit
+            result = self.func(*self.args, **self.kwargs)
+        except Exception:
+            self.signals.error.emit(traceback.format_exc())
+        else:
+            self.signals.finished.emit(result)
+
+
+# =========================================================
+# Text helpers
+# =========================================================
+def normalize_text(value) -> str:
+    if value is None:
+        return ""
+    if pd is not None:
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+    return str(value).strip()
+
+
+def normalize_text_for_match(value) -> str:
+    text = str(value or "").replace("&amp;amp;", "&").lower().replace("&amp;", "and")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_file_key(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def decode_note_html(value) -> str:
+    text = normalize_text(value)
+    previous = None
+    while previous != text:
+        previous = text
+        text = html.unescape(text)
+    return text
+
+
+def remove_only_known_html_tags(text) -> str:
+    text = decode_note_html(text)
+    for tag in KNOWN_HTML_TAGS:
+        text = re.sub(rf"&amp;lt;/?{tag}\b[^&amp;gt;]*&amp;gt;", " ", text, flags=re.IGNORECASE)
+        text = re.sub(rf"&lt;/?{tag}\b[^&gt;]*&gt;", " ", text, flags=re.IGNORECASE)
+    return text
+
+
+def clean_match_text(value) -> str:
+    text = remove_only_known_html_tags(value).lower()
+    text = text.replace("&amp;amp;", "and").replace("&amp;", "and")
+    text = text.replace("&amp;lt;", " ").replace("&amp;gt;", " ")
+    text = text.replace("&lt;", " ").replace("&gt;", " ")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def compact_match_text(value) -> str:
+    return clean_match_text(value).replace(" ", "")
+
+
+def text_contains_value(haystack, needle) -> bool:
+    cleaned_needle = clean_match_text(needle)
+    if not cleaned_needle:
+        return True
+    cleaned_haystack = clean_match_text(haystack)
+    return cleaned_needle in cleaned_haystack or compact_match_text(needle) in compact_match_text(haystack)
+
+
+def clean_text(value) -> str:
+    text = str(value or "").replace("&amp;amp;", "&")
+    text = re.sub(r"[£¥§ß¢$]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# =========================================================
+# HTML note formatter for Section 2 Manual
+# =========================================================
+class NoteHTMLParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.stack: list[str] = []
+        self.segments: list[tuple[str, dict[str, bool]]] = []
+
+    def current_style(self) -> dict[str, bool]:
+        return {
+            "sup": "sup" in self.stack,
+            "sub": "sub" in self.stack,
+            "bold": "b" in self.stack or "strong" in self.stack,
+            "italic": "i" in self.stack or "em" in self.stack,
+            "underline": "u" in self.stack,
+        }
+
+    def handle_starttag(self, tag, attrs):
+        tag_lower = tag.lower()
+        if tag_lower in ["sup", "sub", "b", "strong", "i", "em", "u"]:
+            self.stack.append(tag_lower)
+        elif tag_lower in ["br", "p", "div"]:
+            self.handle_data(" ")
+        else:
+            attr_text = "".join(f' {name}="{value}"' for name, value in attrs)
+            self.handle_data(f"<{tag}{attr_text}>")
+
+    def handle_endtag(self, tag):
+        tag_lower = tag.lower()
+        if tag_lower in ["sup", "sub", "b", "strong", "i", "em", "u"]:
+            for index in range(len(self.stack) - 1, -1, -1):
+                if self.stack[index] == tag_lower:
+                    del self.stack[index]
+                    break
+        elif tag_lower not in ["br", "p", "div"]:
+            self.handle_data(f"</{tag}>")
+
+    def handle_data(self, data):
+        if data:
+            self.segments.append((html.unescape(data), self.current_style().copy()))
+
+    def handle_entityref(self, name):
+        self.handle_data(html.unescape(f"&{name};"))
+
+    def handle_charref(self, name):
+        self.handle_data(html.unescape(f"&#{name};"))
+
+
+def parse_note_html(value) -> list[tuple[str, dict[str, bool]]]:
+    parser = NoteHTMLParser()
+    parser.feed(decode_note_html(value))
+    parser.close()
+    return parser.segments
+
+
+def apply_run_note_style(run, style: dict[str, bool]) -> None:
+    run.font.name = NOTE_FONT_NAME
+    run.font.size = Pt(NOTE_FONT_SIZE_PT)
+    run.font.bold = bool(style.get("bold"))
+    run.font.italic = bool(style.get("italic"))
+    run.font.underline = bool(style.get("underline"))
+    if style.get("sup") or style.get("sub"):
+        r_pr = run._r.get_or_add_rPr()
+        r_pr.set("baseline", "30000" if style.get("sup") else "-25000")
+
+
+def set_note_shape_html_text(shape, note_html_text) -> None:
+    if not getattr(shape, "has_text_frame", False):
+        return
+    text_frame = shape.text_frame
+    text_frame.clear()
+    paragraph = text_frame.paragraphs[0]
+    for text, style in parse_note_html(note_html_text):
+        if not text:
+            continue
+        run = paragraph.add_run()
+        run.text = text
+        apply_run_note_style(run, style)
+
+
+# =========================================================
+# PPT helpers
+# =========================================================
+def iterate_shapes(shapes):
+    for shape in shapes:
+        yield shape
+        if hasattr(shape, "shapes"):
+            yield from iterate_shapes(shape.shapes)
+
+
+def iter_shapes(shapes):
+    for shape in shapes:
+        yield shape
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            yield from iter_shapes(shape.shapes)
+
+
+def shape_has_text(shape) -> bool:
+    return getattr(shape, "has_text_frame", False)
+
+
+def get_shape_name(shape) -> str:
+    try:
+        return shape.name or ""
+    except Exception:
+        return ""
+
+
+def get_shape_text(shape) -> str:
+    if shape_has_text(shape):
+        try:
+            return shape.text_frame.text or ""
+        except Exception:
+            return ""
+    if getattr(shape, "has_table", False):
+        parts = []
+        try:
+            for row in shape.table.rows:
+                for cell in row.cells:
+                    if cell.text:
+                        parts.append(cell.text)
+        except Exception:
+            pass
+        return "\n".join(parts)
+    return ""
+
+
+def get_slide_text(slide) -> str:
+    parts = []
+    for shape in iter_shapes(slide.shapes):
+        text = get_shape_text(shape)
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def find_shape_by_name(slide, target_name):
+    target = normalize_text_for_match(target_name)
+    for shape in iter_shapes(slide.shapes):
+        if normalize_text_for_match(get_shape_name(shape)) == target:
+            return shape
+    return None
+
+
+def find_or_create_textbox_below_sector_allocation(slide, target_shape_name: str, progress_cb=None):
+    existing_shape = find_shape_by_name(slide, target_shape_name)
+    if existing_shape is not None:
+        return existing_shape, "existing"
+
+    sector_shape = find_shape_by_name(slide, SECTOR_ALLOCATION_OBJECT_NAME)
+    if sector_shape is None:
+        if progress_cb:
+            progress_cb(
+                f"Target textbox '{target_shape_name}' not found and "
+                f"'{SECTOR_ALLOCATION_OBJECT_NAME}' object also not found. Cannot create textbox."
+            )
+        return None, "sector_allocation_missing"
+
+    left = sector_shape.left
+    top = sector_shape.top + sector_shape.height + Cm(TEXTBOX_GAP_BELOW_SECTOR_CM)
+    width = sector_shape.width
+    height = Cm(DYNAMIC_NOTES_BOX_HEIGHT_CM)
+
+    new_shape = slide.shapes.add_textbox(left, top, width, height)
+    new_shape.name = target_shape_name
+    text_frame = new_shape.text_frame
+    text_frame.clear()
+    text_frame.word_wrap = True
+    text_frame.margin_left = Cm(0.05)
+    text_frame.margin_right = Cm(0.05)
+    text_frame.margin_top = Cm(0.03)
+    text_frame.margin_bottom = Cm(0.03)
+
+    if progress_cb:
+        progress_cb(
+            f"Created textbox '{target_shape_name}' below "
+            f"'{SECTOR_ALLOCATION_OBJECT_NAME}' with {TEXTBOX_GAP_BELOW_SECTOR_CM} cm gap."
+        )
+    return new_shape, "created"
+
+
+# =========================================================
+# Section 2 - Manual Fund Page Note logic
+# =========================================================
+def validate_manual_fund_page_notes(pptx_path, notes, progress_cb=None) -> dict[str, Any]:
+    def log(message: str) -> None:
+        if progress_cb:
+            progress_cb(message)
+
+    pptx_path = Path(pptx_path)
+    if not pptx_path.exists():
+        raise FileNotFoundError(f"Input PPTX not found: {pptx_path}")
+
+    selected_notes = [n for n in notes if n.use and n.scheme.strip() and n.shape_name.strip() and n.note.strip()]
+    if not selected_notes:
+        raise ValueError("No valid manual fund page note rows found.")
+
+    prs = Presentation(str(pptx_path))
+    scheme_match_count = 0
+    object_match_count = 0
+    creatable_count = 0
+    missing_targets = []
+    log("[ManualFundPage] Validation started.")
+
+    for note_item in selected_notes:
+        item_scheme_found = False
+        item_object_found = False
+        item_creatable = False
+        for slide_index, slide in enumerate(prs.slides, start=1):
+            if not text_contains_value(get_slide_text(slide), note_item.scheme):
+                continue
+            item_scheme_found = True
+            scheme_match_count += 1
+            if find_shape_by_name(slide, note_item.shape_name) is not None:
+                item_object_found = True
+                object_match_count += 1
+                log(f"[ManualFundPage] Slide {slide_index}: found '{note_item.shape_name}' for '{note_item.scheme}'.")
+            elif find_shape_by_name(slide, SECTOR_ALLOCATION_OBJECT_NAME) is not None:
+                item_creatable = True
+                creatable_count += 1
+                log(f"[ManualFundPage] Slide {slide_index}: '{note_item.shape_name}' missing, but can be created below '{SECTOR_ALLOCATION_OBJECT_NAME}' for '{note_item.scheme}'.")
+        if not item_scheme_found or (not item_object_found and not item_creatable):
+            missing_targets.append(f"{note_item.scheme} / {note_item.shape_name}")
+
+    log(f"[ManualFundPage] Validation scheme matches: {scheme_match_count}")
+    log(f"[ManualFundPage] Validation object matches: {object_match_count}")
+    log(f"[ManualFundPage] Validation creatable missing textboxes: {creatable_count}")
+    return {
+        "scheme_matches": scheme_match_count,
+        "object_matches": object_match_count,
+        "creatable_count": creatable_count,
+        "missing_targets": missing_targets,
+    }
+
+
+def run_manual_fund_page_note_process(pptx_path, output_path, notes, progress_cb=None) -> dict[str, Any]:
+    def log(message: str) -> None:
+        if progress_cb:
+            progress_cb(message)
+
+    pptx_path = Path(pptx_path)
+    output_path = Path(output_path)
+    if not pptx_path.exists():
+        raise FileNotFoundError(f"Input PPTX not found: {pptx_path}")
+
+    selected_notes = [n for n in notes if n.use and n.scheme.strip() and n.shape_name.strip() and n.note.strip()]
+    if not selected_notes:
+        raise ValueError("No valid manual fund page notes found.")
+
+    prs = Presentation(str(pptx_path))
+    updated_count = 0
+    created_count = 0
+    missing_items = []
+    total_notes = max(1, len(selected_notes))
+    log("[ManualFundPage] Progress: 0%")
+
+    for note_index, note_item in enumerate(selected_notes, start=1):
+        item_updated = False
+        for slide_index, slide in enumerate(prs.slides, start=1):
+            if not text_contains_value(get_slide_text(slide), note_item.scheme):
+                continue
+
+            target_shape, target_status = find_or_create_textbox_below_sector_allocation(slide, note_item.shape_name, progress_cb=log)
+            if target_shape is None:
+                log(f"[ManualFundPage] Slide {slide_index}: SKIP - could not find or create '{note_item.shape_name}' for '{note_item.scheme}'.")
+                continue
+            if not getattr(target_shape, "has_text_frame", False):
+                log(f"[ManualFundPage] Slide {slide_index}: '{note_item.shape_name}' has no text frame.")
+                continue
+
+            set_note_shape_html_text(target_shape, note_item.note.strip())
+            updated_count += 1
+            item_updated = True
+            if target_status == "created":
+                created_count += 1
+                log(f"[ManualFundPage] Slide {slide_index}: created and updated '{note_item.shape_name}' for '{note_item.scheme}'.")
+            else:
+                log(f"[ManualFundPage] Slide {slide_index}: updated '{note_item.shape_name}' for '{note_item.scheme}'.")
+
+        if not item_updated:
+            missing_items.append(f"{note_item.scheme} / {note_item.shape_name}")
+        log(f"[ManualFundPage] Progress: {int((note_index / total_notes) * 90)}%")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(output_path))
+    log(f"[ManualFundPage] Saved: {output_path}")
+    log("[ManualFundPage] Progress: 100%")
+    return {"output_path": output_path, "objects_updated": updated_count, "objects_created": created_count, "missing_items": missing_items}
+
+
+# =========================================================
+# Section 1 - Age-Based Notes logic
+# =========================================================
+def canonical_note_key(value):
+    if value is None:
+        return ""
+    raw = str(value).replace("&amp;amp;", "&").strip()
+    marker = ""
+    for char in raw:
+        if char.isspace():
+            continue
+        if char in {"*", "^", "#", "@"}:
+            marker = char
+        break
+    return f"{marker}|{normalize_text_for_match(raw)}"
+
+
+def get_text_frame_paragraph_texts(shape):
+    texts = []
+    if not getattr(shape, "has_text_frame", False):
+        return texts
+    try:
+        for paragraph in shape.text_frame.paragraphs:
+            text = "".join(run.text for run in paragraph.runs).strip()
+            if not text:
+                text = getattr(paragraph, "text", "").strip()
+            if text:
+                texts.append(text)
+    except Exception:
+        texts = [line.strip() for line in (shape.text_frame.text or "").splitlines() if line.strip()]
+    return texts
+
+
+def note_already_exists(shape, note_text):
+    required_key = canonical_note_key(note_text)
+    return any(canonical_note_key(p) == required_key for p in get_text_frame_paragraph_texts(shape))
+
+
+def normalize_for_match(value):
+    remove_words = {"bandhan", "mutual", "fund", "regular", "direct", "growth", "plan", "option", "idcw", "dividend", "scheme", "the", "and"}
+    return " ".join(word for word in normalize_text_for_match(value).split() if word not in remove_words)
+
+
+def similarity(a, b):
+    a = normalize_for_match(a)
+    b = normalize_for_match(b)
+    return 0.0 if not a or not b else SequenceMatcher(None, a, b).ratio()
+
+
+def ordinal_day(day):
+    suffix = "th" if 10 <= day % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def format_date_with_ordinal(dt):
+    return f"{ordinal_day(dt.day)} {dt.strftime('%B')} {dt.year}"
+
+
+def parse_date(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip().replace("–", "-").replace("—", "-")
+    if not text:
+        return None
+    text = re.sub(r"(\d{1,2})(st|nd|rd|th)", r"\1", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    formats = [
+        "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y", "%d-%b-%Y", "%d/%b/%Y", "%d %b %Y",
+        "%d-%B-%Y", "%d/%B/%Y", "%d %B %Y", "%Y-%m-%d", "%d-%m-%y", "%d/%m/%y",
+        "%d-%b-%y", "%d %b %y"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    for pattern in [r"\b\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b", r"\b\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{2,4}\b", r"\b\d{4}-\d{1,2}-\d{1,2}\b"]:
+        match = re.search(pattern, text)
+        if match:
+            parsed = parse_date(match.group(0))
+            if parsed:
+                return parsed
+    return None
+
+
+def completed_years(launch_date, as_of_date):
+    years = as_of_date.year - launch_date.year
+    if (as_of_date.month, as_of_date.day) < (launch_date.month, launch_date.day):
+        years -= 1
+    return years
+
+
+def build_risk_free_note(risk_free_rate, mibor_date):
+    rate = str(risk_free_rate).strip().replace("%", "")
+    try:
+        rate = f"{float(rate):.2f}"
+    except ValueError:
+        pass
+    return f"*Risk-free rate assumed to be {rate}% (FBIL OVERNIGHT MIBOR as on {format_date_with_ordinal(mibor_date)}). Ratios calculated on the basis of 3 years history of monthly data."
+
+
+def add_ubuntu_6_run(paragraph, text):
+    run = paragraph.add_run()
+    run.text = text
+    run.font.name = NOTE_FONT_NAME
+    run.font.size = NOTE_FONT_SIZE
+    return run
+
+
+def append_text_to_shape(shape, note_text):
+    if not shape_has_text(shape):
+        return False, "not_text_shape"
+    if note_already_exists(shape, note_text):
+        return True, "already_exists"
+    text_frame = shape.text_frame
+    existing = text_frame.text or ""
+    paragraph = text_frame.add_paragraph() if existing.strip() else text_frame.paragraphs[0]
+    if not existing.strip():
+        text_frame.clear()
+        paragraph = text_frame.paragraphs[0]
+    add_ubuntu_6_run(paragraph, note_text)
+    return True, "added"
+
+
+def find_launch_date_in_slide(slide):
+    lines = [line.strip() for line in get_slide_text(slide).splitlines() if line.strip()]
+    for idx, line in enumerate(lines):
+        if any(label in normalize_text_for_match(line) for label in LAUNCH_DATE_LABELS):
+            parsed = parse_date(line)
+            if parsed:
+                return parsed
+            for nearby in lines[idx + 1: idx + 4]:
+                parsed = parse_date(nearby)
+                if parsed:
+                    return parsed
+    return None
+
+
+def detect_fund_name_from_slide(slide):
+    candidates = []
+    for shape in iter_shapes(slide.shapes):
+        text = clean_text(get_shape_text(shape))
+        if not text:
+            continue
+        for line in text.splitlines():
+            line = clean_text(line)
+            norm = normalize_text_for_match(line)
+            if "bandhan" in norm and "fund" in norm and len(line) <= 120:
+                candidates.append(line)
+    return sorted(set(candidates), key=lambda item: (len(item), item))[0] if candidates else ""
+
+
+def load_launch_dates_from_excel(excel_path, sheet_name=None, log=None):
+    if not excel_path:
+        return {}
+    workbook = load_workbook(excel_path, data_only=True, read_only=True)
+    mapping = {}
+    try:
+        sheets = [workbook[sheet_name]] if sheet_name else workbook.worksheets
+        for worksheet in sheets:
+            rows = list(worksheet.iter_rows(min_row=1, max_row=min(worksheet.max_row or 0, 1000), min_col=1, max_col=min(worksheet.max_column or 0, 80), values_only=True))
+            for header_idx, row in enumerate(rows[:25]):
+                headers = [normalize_text_for_match(value) for value in row]
+                fund_col = None
+                launch_col = None
+                for col_idx, header in enumerate(headers):
+                    if fund_col is None and ("scheme name" in header or "fund name" in header or header in {"scheme", "fund"}):
+                        fund_col = col_idx
+                    if launch_col is None and ("launch date regular" in header or "regular launch date" in header or ("launch date" in header and "regular" in header) or "inception date regular" in header):
+                        launch_col = col_idx
+                if launch_col is None:
+                    for col_idx, header in enumerate(headers):
+                        if "launch date" in header or "inception date" in header:
+                            launch_col = col_idx
+                            break
+                if fund_col is None or launch_col is None:
+                    continue
+                for data_row in rows[header_idx + 1:]:
+                    if fund_col >= len(data_row) or launch_col >= len(data_row):
+                        continue
+                    fund_name = clean_text(data_row[fund_col])
+                    launch_date = parse_date(data_row[launch_col])
+                    if fund_name and launch_date:
+                        mapping[fund_name] = launch_date
+                if mapping:
+                    if log:
+                        log(f"Loaded {len(mapping)} launch dates from Excel sheet '{worksheet.title}'.")
+                    return mapping
+        return mapping
+    finally:
+        workbook.close()
+
+
+def find_launch_date_for_fund(fund_name, launch_date_map):
+    if not fund_name or not launch_date_map:
+        return None, 0.0, ""
+    best_name = ""
+    best_date = None
+    best_score = 0.0
+    for excel_fund_name, launch_date in launch_date_map.items():
+        score = similarity(fund_name, excel_fund_name)
+        if score > best_score:
+            best_score = score
+            best_name = excel_fund_name
+            best_date = launch_date
+    return (best_date, best_score, best_name) if best_score >= 0.35 else (None, best_score, best_name)
+
+
+def build_notes_by_age(launch_date, as_of_date, risk_free_rate, mibor_date):
+    age_years = completed_years(launch_date, as_of_date)
+    notes = [build_risk_free_note(risk_free_rate, mibor_date) if age_years >= 3 else SHORT_TIMEFRAME_NOTE]
+    notes.append(PORTFOLIO_TURNOVER_NOTE if age_years >= 1 else SHORT_TIMEFRAME_NOTE)
+    if 1 <= age_years < 5:
+        notes.append(ONE_TO_FIVE_YEAR_NOTE)
+    unique_notes = []
+    seen = set()
+    for note in notes:
+        key = canonical_note_key(note)
+        if key not in seen:
+            unique_notes.append(note)
+            seen.add(key)
+    return unique_notes, age_years
+
+
+def detect_age_ppt_category(pptx_path: Path) -> tuple[int, str] | None:
+    key = normalize_file_key(pptx_path.stem)
+    # Check passive first so equity_passive does not get classified as Equity.
+    for order in [3, 4, 0, 1, 2]:
+        label, patterns = AGE_PPT_DETECTION_GROUPS[order]
+        for pattern in patterns:
+            if pattern in key:
+                return order, label
+    return None
+
+
+def detect_age_based_pptx_files(source_folder: str | Path) -> list[Path]:
+    folder = Path(source_folder)
+    if not folder.exists() or not folder.is_dir():
+        return []
+
+    matched: list[tuple[int, str, Path]] = []
+    seen: set[Path] = set()
+    for pptx_path in folder.glob("*.pptx"):
+        if pptx_path.name.startswith("~$"):
+            continue
+        detected = detect_age_ppt_category(pptx_path)
+        if detected is None:
+            continue
+        order, _label = detected
+        resolved = pptx_path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            matched.append((order, pptx_path.name.lower(), pptx_path))
+
+    return [item[2] for item in sorted(matched, key=lambda item: (item[0], item[1]))]
+
+
+def run_age_based_notes_process_for_one_ppt(pptx_path, output_path, notes_box_name, as_of_date_value, risk_free_rate, mibor_date_value, launch_date_map=None, progress_cb=None):
+    def log(message: str) -> None:
+        if progress_cb:
+            progress_cb(message)
+
+    pptx_path = Path(pptx_path)
+    output_path = Path(output_path)
+    if not pptx_path.exists():
+        raise FileNotFoundError(f"PPTX not found: {pptx_path}")
+
+    launch_date_map = launch_date_map or {}
+    prs = Presentation(str(pptx_path))
+    total_slides = len(prs.slides)
+    updated_slides = 0
+    skipped_slides = 0
+    created_notes_boxes = 0
+
+    log(f"[AgeBased] Processing PPT: {pptx_path.name}")
+
+    for slide_idx, slide in enumerate(prs.slides, start=1):
+        notes_shape, notes_shape_status = find_or_create_textbox_below_sector_allocation(slide, notes_box_name, progress_cb=log)
+
+        if notes_shape is None:
+            log(f"[AgeBased] {pptx_path.name} | Slide {slide_idx}: SKIP - NotesBox '{notes_box_name}' not found and could not be created below '{SECTOR_ALLOCATION_OBJECT_NAME}'.")
+            skipped_slides += 1
+            continue
+
+        if notes_shape_status == "created":
+            created_notes_boxes += 1
+            log(f"[AgeBased] {pptx_path.name} | Slide {slide_idx}: NotesBox was missing. Created dynamically below '{SECTOR_ALLOCATION_OBJECT_NAME}'.")
+
+        fund_name = detect_fund_name_from_slide(slide)
+        launch_date = find_launch_date_in_slide(slide)
+        source = "PPT"
+        if launch_date is None:
+            launch_date, score, matched_name = find_launch_date_for_fund(fund_name, launch_date_map)
+            source = f"Excel match '{matched_name}' score={score:.2f}" if launch_date else "Not found"
+        if launch_date is None:
+            log(f"[AgeBased] {pptx_path.name} | Slide {slide_idx}: SKIP - launch date not found. Fund detected: '{fund_name}'.")
+            skipped_slides += 1
+            continue
+
+        notes, age_years = build_notes_by_age(launch_date, as_of_date_value, risk_free_rate, mibor_date_value)
+        log(f"[AgeBased] {pptx_path.name} | Slide {slide_idx}: Fund='{fund_name or 'Not detected'}'")
+        log(f"  Launch Date: {launch_date.strftime('%d-%b-%Y')} | Source: {source} | Completed years: {age_years}")
+
+        added_count = 0
+        verified_count = 0
+        for note in notes:
+            ok, status = append_text_to_shape(notes_shape, note)
+            if ok and status == "added":
+                added_count += 1
+                log(f"  Added note: {note}")
+            elif ok and status == "already_exists":
+                verified_count += 1
+                log(f"  Note already exists: {note}")
+            else:
+                log(f"  FAILED to add note: {note}")
+
+        if added_count or verified_count:
+            updated_slides += 1
+        else:
+            skipped_slides += 1
+        log(f"[AgeBased] {pptx_path.name} slide progress: {int((slide_idx / max(1, total_slides)) * 100)}%")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(output_path))
+    log(f"[AgeBased] Saved output PPT: {output_path}")
+
+    return {
+        "input_path": pptx_path,
+        "output_path": output_path,
+        "updated_slides": updated_slides,
+        "skipped_slides": skipped_slides,
+        "created_notes_boxes": created_notes_boxes,
+    }
+
+
+def run_age_based_notes_batch_process(source_folder, output_folder, notes_box_name, as_of_date_value, risk_free_rate, mibor_date_value, excel_path=None, excel_sheet_name=None, progress_cb=None):
+    def log(message: str) -> None:
+        if progress_cb:
+            progress_cb(message)
+
+    source_folder = Path(source_folder)
+    output_folder = Path(output_folder)
+    if not source_folder.exists() or not source_folder.is_dir():
+        raise FileNotFoundError(f"Source PPT folder not found: {source_folder}")
+
+    pptx_files = detect_age_based_pptx_files(source_folder)
+    if not pptx_files:
+        raise ValueError("No matching PPTX files found in source folder. Expected file names containing Equity, Debt, Hybrid, Equity Passive, or Debt Passive. The word 'updated' is optional.")
+
+    output_folder.mkdir(parents=True, exist_ok=True)
+    launch_date_map = load_launch_dates_from_excel(excel_path, excel_sheet_name, log) if excel_path else {}
+
+    log("[AgeBased] Progress: 0%")
+    log(f"[AgeBased] Source folder: {source_folder}")
+    log(f"[AgeBased] Output folder: {output_folder}")
+    log(f"[AgeBased] Detected PPT files: {len(pptx_files)}")
+    for path in pptx_files:
+        detected = detect_age_ppt_category(path)
+        label = detected[1] if detected else "Unknown"
+        log(f"  - {path.name} [{label}]")
+
+    results = []
+    total_files = len(pptx_files)
+    for file_index, pptx_path in enumerate(pptx_files, start=1):
+        output_path = output_folder / f"{pptx_path.stem}_age_notes_updated.pptx"
+        if pptx_path.resolve() == output_path.resolve():
+            output_path = output_folder / f"{pptx_path.stem}_age_notes_updated_copy.pptx"
+
+        log("-" * 80)
+        log(f"[AgeBased] File {file_index}/{total_files}: {pptx_path.name}")
+        result = run_age_based_notes_process_for_one_ppt(
+            pptx_path=pptx_path,
+            output_path=output_path,
+            notes_box_name=notes_box_name,
+            as_of_date_value=as_of_date_value,
+            risk_free_rate=risk_free_rate,
+            mibor_date_value=mibor_date_value,
+            launch_date_map=launch_date_map,
+            progress_cb=log,
+        )
+        results.append(result)
+        log(f"[AgeBased] Progress: {int((file_index / max(1, total_files)) * 100)}%")
+
+    total_updated = sum(item["updated_slides"] for item in results)
+    total_skipped = sum(item["skipped_slides"] for item in results)
+    total_created = sum(item["created_notes_boxes"] for item in results)
+
+    log("[AgeBased] Progress: 100%")
+    log(f"[AgeBased] Batch complete. Files processed: {len(results)}")
+
+    return {
+        "output_folder": output_folder,
+        "files_processed": len(results),
+        "detected_files": pptx_files,
+        "results": results,
+        "updated_slides": total_updated,
+        "skipped_slides": total_skipped,
+        "created_notes_boxes": total_created,
+    }
+
+
+# =========================================================
+# GUI
+# =========================================================
+class CombinedFundPageNotesWindow(QWidget):
+    COL_USE = 0
+    COL_SCHEME = 1
+    COL_SHAPE = 2
+    COL_NOTE = 3
+    COL_SOURCE = 4
+
+    def __init__(self, state: Any | None = None):
+        super().__init__()
+        self.state = state
+        self.thread_pool = QThreadPool.globalInstance()
+        self.manual_worker: FunctionWorker | None = None
+        self.age_worker: FunctionWorker | None = None
+        self.default_output_folder = self._resolve_default_output_folder()
+        self._build_ui()
+        self._apply_default_output_paths()
+        self._load_default_manual_rows()
+        self._set_age_progress_idle()
+        self._set_manual_progress_idle()
+
+    def _app_run_folder(self) -> Path:
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parent
+
+    def _resolve_default_output_folder(self) -> Path:
+        """Return the Tab 2 root folder, not an old section folder."""
+        state_folder = None
+        if self.state is not None:
+            state_folder = (
+                getattr(self.state, "tab2_root_folder", None)
+                or getattr(self.state, "tab2_output_folder", None)
+            )
+        if state_folder:
+            folder = Path(state_folder)
+        else:
+            output_root = getattr(self.state, "output_root", None) if self.state is not None else None
+            folder = Path(output_root) if output_root else self._app_run_folder() / "output" / "02_fund_pages_automation"
+        folder.mkdir(parents=True, exist_ok=True)
+        if self.state is not None:
+            setattr(self.state, "tab2_root_folder", folder)
+            setattr(self.state, "tab2_output_folder", folder)
+        return folder
+
+    def _tab2_section_output_folder(self, attr_name: str, folder_name: str, *alias_names: str) -> Path:
+        """Resolve a Tab 2 section output folder under the Tab 2 root and publish aliases."""
+        folder = None
+        if self.state is not None:
+            for name in (attr_name, *alias_names):
+                value = getattr(self.state, name, None)
+                if value:
+                    folder = Path(value)
+                    break
+        if folder is None:
+            folder = self._resolve_default_output_folder() / folder_name
+        folder.mkdir(parents=True, exist_ok=True)
+        if self.state is not None:
+            for name in (attr_name, *alias_names):
+                setattr(self.state, name, folder)
+        return folder
+
+    def _apply_default_output_paths(self) -> None:
+        self.default_output_folder = self._resolve_default_output_folder()
+        age_folder = self._tab2_section_output_folder(
+            "tab2_section2_age_based_notes_folder",
+            "02_age_based_notes",
+            "tab2_age_based_folder",
+        )
+        manual_folder = self._tab2_section_output_folder(
+            "tab2_section3_manual_fund_page_note_folder",
+            "03_manual_fund_page_note",
+            "tab2_manual_note_folder",
+        )
+        if not self.age_output_folder_edit.text().strip():
+            self.age_output_folder_edit.setText(str(age_folder))
+        if not self.manual_output_folder_edit.text().strip():
+            self.manual_output_folder_edit.setText(str(manual_folder))
+
+    def _build_ui(self):
+        self.setWindowTitle(APP_TITLE)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(8)
+        splitter = QSplitter()
+        splitter.setChildrenCollapsible(False)
+        root.addWidget(splitter)
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(6, 6, 6, 6)
+        left_layout.setSpacing(8)
+        log_title = QLabel("Process Logs")
+        log_title.setStyleSheet("font-weight: bold;")
+        left_layout.addWidget(log_title)
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        left_layout.addWidget(self.log_box, stretch=1)
+        self.btn_clear_log = QPushButton("Clear Log")
+        left_layout.addWidget(self.btn_clear_log)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        panel = QWidget()
+        right_layout = QVBoxLayout(panel)
+        right_layout.setContentsMargins(6, 6, 12, 6)
+        right_layout.setSpacing(10)
+        title = QLabel("Combined Fund Page Notes")
+        title.setStyleSheet("font-weight: bold; font-size: 16px;")
+        right_layout.addWidget(title)
+        desc = QLabel(
+            "Updated order: Section 1 is Age-Based Fund Page Notes Updater. "
+            "Section 2 is Manual Fund Page Note."
+        )
+        desc.setWordWrap(True)
+        right_layout.addWidget(desc)
+
+        # UPDATED ORDER: old Section 2 is now first; old Section 1 is now second.
+        right_layout.addWidget(self._build_age_based_section())
+        right_layout.addWidget(self._build_manual_section())
+        right_layout.addStretch(1)
+        scroll.setWidget(panel)
+
+        splitter.addWidget(left_widget)
+        splitter.addWidget(scroll)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([360, 1080])
+        self.btn_clear_log.clicked.connect(self.log_box.clear)
+
+    # =====================================================
+    # Section 1 UI - Age-Based Fund Page Notes Updater
+    # =====================================================
+    def _build_age_based_section(self):
+        group = QGroupBox("Section 1 - Age-Based Fund Page Notes Updater")
+        layout = QVBoxLayout(group)
+        info = QLabel(
+            "Process 1: Select one PPTX file. The app updates that selected deck only and saves the updated file in the selected output folder. "
+            "The old source-folder detection logic has been removed from the UI."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        input_group = QGroupBox("1. Input Files")
+        input_layout = QGridLayout(input_group)
+        self.age_pptx_edit = QLineEdit()
+        self.age_excel_edit = QLineEdit()
+        self.btn_age_browse_pptx = QPushButton("Browse PPTX File...")
+        self.btn_age_browse_excel = QPushButton("Browse fundmanagerdetails Excel...")
+        input_layout.addWidget(QLabel("PPTX File:"), 0, 0)
+        input_layout.addWidget(self.age_pptx_edit, 0, 1)
+        input_layout.addWidget(self.btn_age_browse_pptx, 0, 2)
+        input_layout.addWidget(QLabel("fundmanagerdetails Excel:"), 1, 0)
+        input_layout.addWidget(self.age_excel_edit, 1, 1)
+        input_layout.addWidget(self.btn_age_browse_excel, 1, 2)
+        layout.addWidget(input_group)
+
+        settings_group = QGroupBox("2. Note Settings")
+        settings_layout = QGridLayout(settings_group)
+        self.age_asof_date_edit = QLineEdit(previous_month_end().strftime("%d-%m-%Y"))
+        self.age_risk_free_edit = QLineEdit()
+        self.age_risk_free_edit.setPlaceholderText("Example: 6.25")
+        self.age_mibor_date_edit = QLineEdit(date.today().strftime("%d-%m-%Y"))
+        self.age_sheet_edit = QLineEdit()
+        self.age_sheet_edit.setPlaceholderText("Optional. Blank = auto detect first valid sheet")
+        settings_layout.addWidget(QLabel("As-of / Uploader Date:"), 0, 0)
+        settings_layout.addWidget(self.age_asof_date_edit, 0, 1)
+        settings_layout.addWidget(QLabel("Risk-free Rate %:"), 1, 0)
+        settings_layout.addWidget(self.age_risk_free_edit, 1, 1)
+        settings_layout.addWidget(QLabel("MIBOR Date:"), 2, 0)
+        settings_layout.addWidget(self.age_mibor_date_edit, 2, 1)
+        settings_layout.addWidget(QLabel("Excel Sheet Name:"), 3, 0)
+        settings_layout.addWidget(self.age_sheet_edit, 3, 1)
+        layout.addWidget(settings_group)
+
+        output_group = QGroupBox("3. Output")
+        output_layout = QGridLayout(output_group)
+        self.age_output_folder_edit = QLineEdit()
+        self.btn_age_browse_output_folder = QPushButton("Browse Output Folder...")
+        output_layout.addWidget(QLabel("Output Folder:"), 0, 0)
+        output_layout.addWidget(self.age_output_folder_edit, 0, 1)
+        output_layout.addWidget(self.btn_age_browse_output_folder, 0, 2)
+        layout.addWidget(output_group)
+
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        self.age_status_label = QLabel("Idle")
+        self.age_progress_bar = QProgressBar()
+        self.age_progress_bar.setRange(0, 100)
+        self.age_progress_bar.setValue(0)
+        progress_layout.addWidget(self.age_status_label)
+        progress_layout.addWidget(self.age_progress_bar)
+        layout.addWidget(progress_group)
+
+        run_row = QHBoxLayout()
+        run_row.addStretch(1)
+        self.btn_age_run = QPushButton("Run Age-Based Notes Update For Selected PPTX")
+        run_row.addWidget(self.btn_age_run)
+        layout.addLayout(run_row)
+
+        self.btn_age_browse_pptx.clicked.connect(self.age_browse_pptx_file)
+        self.btn_age_browse_excel.clicked.connect(self.age_browse_excel)
+        self.btn_age_browse_output_folder.clicked.connect(self.age_browse_output_folder)
+        self.btn_age_run.clicked.connect(self.age_start_process)
+        return group
+
+    # =====================================================
+    # Section 2 UI - Manual Fund Page Note
+    # =====================================================
+    
+    def _build_manual_section(self):
+        group = QGroupBox("Section 2 - Manual Fund Page Note")
+        layout = QVBoxLayout(group)
+        info = QLabel("Process 2: Scheme Name + PPT Object Name + Note Text. This replaces text inside the specific PPT object. If missing, textbox is created below SectorAllocation.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        input_group = QGroupBox("1. PPT Input / Output")
+        grid = QGridLayout(input_group)
+        self.manual_input_pptx_edit = QLineEdit()
+        self.manual_output_folder_edit = QLineEdit()
+        self.manual_output_name_edit = QLineEdit()
+        self.manual_output_name_edit.setPlaceholderText("Example: Fund_Manager_Performance_Fund_Page_Notes_Updated.pptx")
+        self.btn_manual_browse_pptx = QPushButton("Browse PPTX...")
+        self.btn_manual_browse_output = QPushButton("Browse Output Folder...")
+        grid.addWidget(QLabel("Input PPTX:"), 0, 0)
+        grid.addWidget(self.manual_input_pptx_edit, 0, 1)
+        grid.addWidget(self.btn_manual_browse_pptx, 0, 2)
+        grid.addWidget(QLabel("Output Folder:"), 1, 0)
+        grid.addWidget(self.manual_output_folder_edit, 1, 1)
+        grid.addWidget(self.btn_manual_browse_output, 1, 2)
+        grid.addWidget(QLabel("Output PPTX Name:"), 2, 0)
+        grid.addWidget(self.manual_output_name_edit, 2, 1)
+        layout.addWidget(input_group)
+
+        notes_group = QGroupBox("2. Manual Fund Page Notes")
+        notes_layout = QVBoxLayout(notes_group)
+        self.manual_notes_table = QTableWidget(0, 5)
+        self.manual_notes_table.setHorizontalHeaderLabels(["Use?", "Scheme Name", "PPT Object Name", "Note Text", "Source"])
+        self.manual_notes_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.manual_notes_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.manual_notes_table.setMinimumHeight(200)
+        header = self.manual_notes_table.horizontalHeader()
+        header.setSectionResizeMode(self.COL_USE, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.COL_SCHEME, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_SHAPE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_NOTE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.COL_SOURCE, QHeaderView.ResizeMode.ResizeToContents)
+        notes_layout.addWidget(self.manual_notes_table)
+        btn_row = QHBoxLayout()
+        self.btn_manual_add_note = QPushButton("Add Manual Note")
+        self.btn_manual_remove_selected = QPushButton("Remove Selected Note Row(s)")
+        self.btn_manual_remove_checked = QPushButton("Remove Checked Note Row(s)")
+        self.btn_manual_check_all = QPushButton("Check All Notes")
+        self.btn_manual_uncheck_all = QPushButton("Uncheck All Notes")
+        for btn in [self.btn_manual_add_note, self.btn_manual_remove_selected, self.btn_manual_remove_checked, self.btn_manual_check_all, self.btn_manual_uncheck_all]:
+            btn_row.addWidget(btn)
+        btn_row.addStretch(1)
+        notes_layout.addLayout(btn_row)
+        layout.addWidget(notes_group)
+
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        self.manual_status_label = QLabel("Idle")
+        self.manual_progress_bar = QProgressBar()
+        self.manual_progress_bar.setRange(0, 100)
+        self.manual_progress_bar.setValue(0)
+        progress_layout.addWidget(self.manual_status_label)
+        progress_layout.addWidget(self.manual_progress_bar)
+        layout.addWidget(progress_group)
+
+        run_row = QHBoxLayout()
+        run_row.addStretch(1)
+        self.btn_manual_validation = QPushButton("Run Validation")
+        self.btn_manual_run = QPushButton("Run Fund Page Note")
+        run_row.addWidget(self.btn_manual_validation)
+        run_row.addWidget(self.btn_manual_run)
+        layout.addLayout(run_row)
+
+        self.btn_manual_browse_pptx.clicked.connect(self.manual_browse_pptx)
+        self.btn_manual_browse_output.clicked.connect(self.manual_browse_output_folder)
+        self.btn_manual_add_note.clicked.connect(self.manual_add_note_row)
+        self.btn_manual_remove_selected.clicked.connect(self.manual_remove_selected_rows)
+        self.btn_manual_remove_checked.clicked.connect(self.manual_remove_checked_rows)
+        self.btn_manual_check_all.clicked.connect(lambda: self.manual_set_all_checked(True))
+        self.btn_manual_uncheck_all.clicked.connect(lambda: self.manual_set_all_checked(False))
+        self.btn_manual_validation.clicked.connect(self.manual_run_validation)
+        self.btn_manual_run.clicked.connect(self.manual_start_process)
+        return group
+
+    def log(self, text: str) -> None:
+        self.log_box.append(str(text))
+        self.log_box.ensureCursorVisible()
+
+    # =====================================================
+    # Section 2 Manual handlers
+    # =====================================================
+    def _set_manual_progress_idle(self):
+        self.manual_progress_bar.setRange(0, 100)
+        self.manual_progress_bar.setValue(0)
+        self.manual_status_label.setText("Idle")
+
+    def _set_manual_progress_busy(self, text):
+        self.manual_progress_bar.setRange(0, 0)
+        self.manual_status_label.setText(text)
+
+    def manual_on_progress(self, payload):
+        match = re.search(r"(\d{1,3})\s*%", str(payload))
+        if match:
+            self.manual_progress_bar.setRange(0, 100)
+            self.manual_progress_bar.setValue(max(0, min(100, int(match.group(1)))))
+        self.log(payload)
+
+    def checkbox_item(self, checked: bool = True):
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        return item
+
+    def _load_default_manual_rows(self):
+        self.manual_notes_table.setRowCount(0)
+        for note in default_fund_page_notes():
+            self.manual_add_note_row(note)
+
+    def manual_add_note_row(self, note: FundPageNote | None = None):
+        note = note or FundPageNote("", "", "", "Manual", True)
+        row = self.manual_notes_table.rowCount()
+        self.manual_notes_table.insertRow(row)
+        self.manual_notes_table.setItem(row, self.COL_USE, self.checkbox_item(note.use))
+        self.manual_notes_table.setItem(row, self.COL_SCHEME, QTableWidgetItem(note.scheme))
+        self.manual_notes_table.setItem(row, self.COL_SHAPE, QTableWidgetItem(note.shape_name))
+        self.manual_notes_table.setItem(row, self.COL_NOTE, QTableWidgetItem(note.note))
+        self.manual_notes_table.setItem(row, self.COL_SOURCE, QTableWidgetItem(note.source))
+
+    def manual_table_text(self, row, col):
+        item = self.manual_notes_table.item(row, col)
+        return item.text().strip() if item else ""
+
+    def manual_get_notes(self):
+        notes = []
+        for row in range(self.manual_notes_table.rowCount()):
+            use_item = self.manual_notes_table.item(row, self.COL_USE)
+            use = bool(use_item and use_item.checkState() == Qt.CheckState.Checked)
+            notes.append(FundPageNote(
+                scheme=self.manual_table_text(row, self.COL_SCHEME),
+                shape_name=self.manual_table_text(row, self.COL_SHAPE),
+                note=self.manual_table_text(row, self.COL_NOTE),
+                source=self.manual_table_text(row, self.COL_SOURCE) or "Manual",
+                use=use,
+            ))
+        return notes
+
+    def manual_remove_selected_rows(self):
+        rows = sorted({index.row() for index in self.manual_notes_table.selectionModel().selectedRows()}, reverse=True)
+        if not rows:
+            QMessageBox.information(self, "No Selection", "Please select one or more rows.")
+            return
+        for row in rows:
+            self.manual_notes_table.removeRow(row)
+
+    def manual_remove_checked_rows(self):
+        for row in reversed(range(self.manual_notes_table.rowCount())):
+            item = self.manual_notes_table.item(row, self.COL_USE)
+            if item and item.checkState() == Qt.CheckState.Checked:
+                self.manual_notes_table.removeRow(row)
+
+    def manual_set_all_checked(self, checked):
+        for row in range(self.manual_notes_table.rowCount()):
+            item = self.manual_notes_table.item(row, self.COL_USE)
+            if item:
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+
+    def manual_browse_pptx(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Manual Fund Page Input PPTX", str(Path.cwd()), "PowerPoint Files (*.pptx)")
+        if path:
+            pptx_path = Path(path)
+            self.manual_input_pptx_edit.setText(str(pptx_path))
+            if not self.manual_output_folder_edit.text().strip():
+                self.manual_output_folder_edit.setText(str(self._resolve_default_output_folder()))
+            if not self.manual_output_name_edit.text().strip():
+                self.manual_output_name_edit.setText(f"{pptx_path.stem}_manual_fund_page_notes_updated.pptx")
+
+    def manual_browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose Manual Fund Page Output Folder", self.manual_output_folder_edit.text().strip() or str(Path.cwd()))
+        if folder:
+            self.manual_output_folder_edit.setText(folder)
+
+    def manual_validate_inputs(self):
+        input_text = self.manual_input_pptx_edit.text().strip()
+        if not input_text:
+            QMessageBox.warning(self, "Invalid Input", "Please select manual input PPTX.")
+            return None
+        input_pptx = Path(input_text)
+        if not input_pptx.exists():
+            QMessageBox.warning(self, "Invalid Input", "Manual input PPTX does not exist.")
+            return None
+        output_folder_text = self.manual_output_folder_edit.text().strip()
+        if not output_folder_text:
+            QMessageBox.warning(self, "Invalid Output", "Please select manual output folder.")
+            return None
+        output_folder = Path(output_folder_text)
+        output_folder.mkdir(parents=True, exist_ok=True)
+        output_name = self.manual_output_name_edit.text().strip()
+        if not output_name:
+            QMessageBox.warning(self, "Invalid Output Name", "Please enter manual output PPTX name.")
+            return None
+        if not output_name.lower().endswith(".pptx"):
+            output_name += ".pptx"
+        notes = [n for n in self.manual_get_notes() if n.use and n.scheme.strip() and n.shape_name.strip() and n.note.strip()]
+        if not notes:
+            QMessageBox.warning(self, "No Notes", "No valid manual note rows selected.")
+            return None
+        return input_pptx, output_folder / output_name, notes
+
+    def manual_run_validation(self):
+        validated = self.manual_validate_inputs()
+        if validated is None:
+            return
+        input_pptx, output_pptx, notes = validated
+        try:
+            result = validate_manual_fund_page_notes(input_pptx, notes, progress_cb=self.log)
+            QMessageBox.information(
+                self,
+                "Manual Validation Complete",
+                f"Input PPTX:\n{input_pptx}\n\nOutput PPTX:\n{output_pptx}\n\nNotes selected: {len(notes)}\n"
+                f"Scheme matches: {result['scheme_matches']}\nObject matches: {result['object_matches']}\n"
+                f"Creatable missing textboxes: {result.get('creatable_count', 0)}\nMissing targets: {len(result['missing_targets'])}"
+            )
+        except Exception:
+            error = traceback.format_exc()
+            self.log(error)
+            QMessageBox.critical(self, "Manual Validation Failed", error)
+
+    def manual_start_process(self):
+        validated = self.manual_validate_inputs()
+        if validated is None:
+            return
+        input_pptx, output_pptx, notes = validated
+        self.log("=" * 80)
+        self.log("[ManualFundPage] Starting manual fund page note process...")
+        self.log(f"[ManualFundPage] Input: {input_pptx}")
+        self.log(f"[ManualFundPage] Output: {output_pptx}")
+        self.btn_manual_run.setEnabled(False)
+        self.btn_manual_validation.setEnabled(False)
+        self._set_manual_progress_busy("Running manual fund page note process...")
+        worker = FunctionWorker(run_manual_fund_page_note_process, input_pptx, output_pptx, notes)
+        self.manual_worker = worker
+        worker.signals.started.connect(lambda: self.log("[ManualFundPage] Worker started"))
+        worker.signals.progress.connect(self.manual_on_progress)
+        worker.signals.finished.connect(self.manual_on_finished)
+        worker.signals.error.connect(self.manual_on_error)
+        self.thread_pool.start(worker)
+
+    def manual_on_finished(self, result):
+        self.manual_worker = None
+        self.btn_manual_run.setEnabled(True)
+        self.btn_manual_validation.setEnabled(True)
+        self.manual_progress_bar.setRange(0, 100)
+        self.manual_progress_bar.setValue(100)
+        self.manual_status_label.setText("Completed")
+        QMessageBox.information(
+            self,
+            "Manual Fund Page Note Complete",
+            f"Manual fund page note process completed.\n\nObjects updated: {result['objects_updated']}\n"
+            f"Objects created: {result.get('objects_created', 0)}\n\nSaved at:\n{result['output_path']}"
+        )
+
+    def manual_on_error(self, error_text):
+        self.manual_worker = None
+        self.btn_manual_run.setEnabled(True)
+        self.btn_manual_validation.setEnabled(True)
+        self._set_manual_progress_idle()
+        self.manual_status_label.setText("Failed")
+        self.log("[ManualFundPage] ERROR")
+        self.log(error_text)
+        QMessageBox.critical(self, "Manual Fund Page Note Failed", error_text)
+
+    # =====================================================
+    # Section 1 Age-Based handlers
+    # =====================================================
+    def _set_age_progress_idle(self):
+        self.age_progress_bar.setRange(0, 100)
+        self.age_progress_bar.setValue(0)
+        self.age_status_label.setText("Idle")
+
+    def _set_age_progress_busy(self, text):
+        self.age_progress_bar.setRange(0, 0)
+        self.age_status_label.setText(text)
+
+    def age_on_progress(self, payload):
+        match = re.search(r"(\d{1,3})\s*%", str(payload))
+        if match:
+            self.age_progress_bar.setRange(0, 100)
+            self.age_progress_bar.setValue(max(0, min(100, int(match.group(1)))))
+        self.log(payload)
+
+    def age_browse_pptx_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select PPTX File",
+            self.age_pptx_edit.text().strip() or str(Path.cwd()),
+            "PowerPoint Files (*.pptx)",
+        )
+        if path:
+            self.age_pptx_edit.setText(path)
+            self.log(f"[AgeBased] Selected PPTX file: {Path(path).name}")
+
+    # Backward-compatible method name. The UI now uses single PPTX selection.
+    def age_browse_source_folder(self):
+        self.age_browse_pptx_file()
+
+    # Backward-compatible no-op/display method. Folder auto-detection is removed.
+    def age_refresh_detected_ppts(self):
+        pptx_text = getattr(self, "age_pptx_edit", QLineEdit()).text().strip()
+        if pptx_text:
+            self.log(f"[AgeBased] Selected PPTX file: {Path(pptx_text).name}")
+        else:
+            self.log("[AgeBased] Please select one PPTX file.")
+
+    def age_browse_excel(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select fundmanagerdetails Excel", str(Path.cwd()), "Excel Files (*.xlsx *.xlsm)")
+        if path:
+            self.age_excel_edit.setText(path)
+
+    def age_browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Choose Age-Based Output Folder",
+            self.age_output_folder_edit.text().strip() or str(self._resolve_default_output_folder()),
+        )
+        if folder:
+            self.age_output_folder_edit.setText(folder)
+
+    def age_validate_inputs(self):
+        pptx_text = self.age_pptx_edit.text().strip()
+        output_folder_text = self.age_output_folder_edit.text().strip()
+        notes_box_name = NOTES_BOX_DEFAULT
+        risk_free_rate = self.age_risk_free_edit.text().strip()
+        excel_text = self.age_excel_edit.text().strip()
+        sheet_name = self.age_sheet_edit.text().strip() or None
+        as_of_date_value = parse_date(self.age_asof_date_edit.text().strip())
+        mibor_date_value = parse_date(self.age_mibor_date_edit.text().strip())
+
+        if not pptx_text:
+            QMessageBox.warning(self, "Invalid Input", "Please select one PPTX file.")
+            return None
+        pptx_path = Path(pptx_text)
+        if not pptx_path.exists() or not pptx_path.is_file():
+            QMessageBox.warning(self, "Invalid Input", "Selected PPTX file does not exist.")
+            return None
+        if pptx_path.suffix.lower() != ".pptx":
+            QMessageBox.warning(self, "Invalid Input", "Please select a .pptx file.")
+            return None
+
+        excel_path = Path(excel_text) if excel_text else None
+        if excel_path and not excel_path.exists():
+            QMessageBox.warning(self, "Invalid Excel", "Selected Excel does not exist.")
+            return None
+
+        if not output_folder_text:
+            QMessageBox.warning(self, "Invalid Output", "Please select output folder.")
+            return None
+        output_folder = Path(output_folder_text)
+        output_folder.mkdir(parents=True, exist_ok=True)
+
+        if not as_of_date_value:
+            QMessageBox.warning(self, "Invalid Date", "Invalid As-of date. Use dd-mm-yyyy.")
+            return None
+        if not mibor_date_value:
+            QMessageBox.warning(self, "Invalid Date", "Invalid MIBOR date. Use dd-mm-yyyy.")
+            return None
+        if not risk_free_rate:
+            QMessageBox.warning(self, "Invalid Rate", "Please enter Risk-free Rate %.")
+            return None
+
+        output_path = output_folder / f"{pptx_path.stem}_age_notes_updated.pptx"
+        return pptx_path, output_path, output_folder, notes_box_name, as_of_date_value, risk_free_rate, mibor_date_value, excel_path, sheet_name
+
+    def age_start_process(self):
+        validated = self.age_validate_inputs()
+        if validated is None:
+            return
+        pptx_path, output_path, output_folder, notes_box_name, as_of_date_value, risk_free_rate, mibor_date_value, excel_path, sheet_name = validated
+
+        self.log("=" * 80)
+        self.log("[AgeBased] Starting age-based notes update for selected PPTX...")
+        self.log(f"[AgeBased] PPTX File: {pptx_path}")
+        self.log(f"[AgeBased] Excel: {excel_path or 'None'}")
+        self.log(f"[AgeBased] Output Folder: {output_folder}")
+        self.log(f"[AgeBased] Output File: {output_path.name}")
+        self.log(f"[AgeBased] Notes object name fixed in backend: {notes_box_name}")
+        self.log(f"[AgeBased] Missing NotesBox will be created below '{SECTOR_ALLOCATION_OBJECT_NAME}' with {TEXTBOX_GAP_BELOW_SECTOR_CM} cm gap.")
+
+        launch_date_map = None
+        if excel_path:
+            try:
+                launch_date_map = load_launch_dates_from_excel(excel_path, sheet_name, log=self.log)
+            except Exception as exc:
+                QMessageBox.warning(self, "Excel Read Failed", f"Could not read launch dates from Excel.\n\n{exc}")
+                return
+
+        self.btn_age_run.setEnabled(False)
+        self._set_age_progress_busy("Running age-based notes update...")
+        worker = FunctionWorker(
+            run_age_based_notes_process_for_one_ppt,
+            pptx_path,
+            output_path,
+            notes_box_name,
+            as_of_date_value,
+            risk_free_rate,
+            mibor_date_value,
+            launch_date_map,
+        )
+        self.age_worker = worker
+        worker.signals.started.connect(lambda: self.log("[AgeBased] Worker started"))
+        worker.signals.progress.connect(self.age_on_progress)
+        worker.signals.finished.connect(self.age_on_finished)
+        worker.signals.error.connect(self.age_on_error)
+        self.thread_pool.start(worker)
+
+    def age_on_finished(self, result):
+        self.age_worker = None
+        self.btn_age_run.setEnabled(True)
+        self.age_progress_bar.setRange(0, 100)
+        self.age_progress_bar.setValue(100)
+        self.age_status_label.setText("Completed")
+
+        if isinstance(result, dict) and "results" in result:
+            file_lines = []
+            for item in result.get("results", []):
+                file_lines.append(f"- {item['input_path'].name} -> {item['output_path'].name}")
+            files_text = "\n".join(file_lines)
+            QMessageBox.information(
+                self,
+                "Age-Based Notes Batch Update Complete",
+                f"Age-based notes batch update completed.\n\n"
+                f"Files processed: {result['files_processed']}\n"
+                f"Updated/verified slides: {result['updated_slides']}\n"
+                f"Skipped slides: {result['skipped_slides']}\n"
+                f"Created NotesBox textboxes: {result.get('created_notes_boxes', 0)}\n\n"
+                f"Output folder:\n{result['output_folder']}\n\n"
+                f"Files:\n{files_text}"
+            )
+            return
+
+        QMessageBox.information(
+            self,
+            "Age-Based Notes Update Complete",
+            f"Age-based notes update completed.\n\n"
+            f"Input file:\n{result['input_path']}\n\n"
+            f"Output file:\n{result['output_path']}\n\n"
+            f"Updated/verified slides: {result['updated_slides']}\n"
+            f"Skipped slides: {result['skipped_slides']}\n"
+            f"Created NotesBox textboxes: {result.get('created_notes_boxes', 0)}"
+        )
+
+    def age_on_error(self, error_text):
+        self.age_worker = None
+        self.btn_age_run.setEnabled(True)
+        self._set_age_progress_idle()
+        self.age_status_label.setText("Failed")
+        self.log("[AgeBased] ERROR")
+        self.log(error_text)
+        QMessageBox.critical(self, "Age-Based Notes Batch Update Failed", error_text)
+
+
+
+# =========================================================
+# Tab 5-style GUI override for Tab 2
+# ---------------------------------------------------------
+# IMPORTANT:
+# - Original logic and original class code above are kept intact.
+# - No original processing function is removed.
+# - This block only overrides the GUI builder at runtime so Tab 2 appears
+#   like Tab 5 with internal section tabs.
+# =========================================================
+
+def _tab2_build_tab5_style_section_tab(self, log_box: QTextEdit, clear_handler: Callable[[], None], right_widget: QWidget) -> QWidget:
+    tab = QWidget()
+    main_layout = QHBoxLayout(tab)
+    main_layout.setContentsMargins(6, 6, 6, 6)
+    main_layout.setSpacing(8)
+
+    left_widget = QWidget()
+    left_layout = QVBoxLayout(left_widget)
+    left_layout.setContentsMargins(6, 6, 6, 6)
+    left_layout.setSpacing(8)
+
+    log_title = QLabel("Process Logs")
+    log_title.setStyleSheet("font-weight: bold; font-size: 13px;")
+    left_layout.addWidget(log_title)
+
+    log_box.setReadOnly(True)
+    left_layout.addWidget(log_box, stretch=1)
+
+    clear_btn = QPushButton("Clear Log")
+    clear_btn.clicked.connect(clear_handler)
+    left_layout.addWidget(clear_btn)
+
+    left_widget.setMinimumWidth(380)
+    left_widget.setMaximumWidth(420)
+
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    panel = QWidget()
+    right_layout = QVBoxLayout(panel)
+    right_layout.setContentsMargins(6, 6, 12, 6)
+    right_layout.setSpacing(10)
+    right_layout.addWidget(right_widget)
+    right_layout.addStretch(1)
+    scroll.setWidget(panel)
+
+    main_layout.addWidget(left_widget)
+    main_layout.addWidget(scroll, stretch=1)
+    return tab
+
+
+def _tab2_tab5_style_build_ui(self):
+    """Tab 2 GUI in Tab 5 style: inner Section tabs with per-section logs."""
+    self.setWindowTitle(APP_TITLE)
+
+    root = QVBoxLayout(self)
+    root.setContentsMargins(6, 6, 6, 6)
+    root.setSpacing(8)
+
+    title = QLabel("Fund Page Notes")
+    title.setStyleSheet("font-weight: bold; font-size: 18px;")
+    root.addWidget(title)
+
+    desc = QLabel(
+        "Section 1 is Age-Based Fund Page Notes Updater. "
+        "Section 2 is Manual Fund Page Note. Each section runs independently."
+    )
+    desc.setWordWrap(True)
+    root.addWidget(desc)
+
+    self.section_tabs = QTabWidget()
+    root.addWidget(self.section_tabs, stretch=1)
+
+    # Section 1 tab - Age-Based Notes
+    self.age_log_box = QTextEdit()
+    self.age_log_box.setReadOnly(True)
+    age_tab = self._build_tab5_style_section_tab(
+        log_box=self.age_log_box,
+        clear_handler=self.age_log_box.clear,
+        right_widget=self._build_age_based_section(),
+    )
+    self.section_tabs.addTab(age_tab, "Section 1 - Age-Based Notes")
+
+    # Section 2 tab - Manual Note
+    self.manual_log_box = QTextEdit()
+    self.manual_log_box.setReadOnly(True)
+    manual_tab = self._build_tab5_style_section_tab(
+        log_box=self.manual_log_box,
+        clear_handler=self.manual_log_box.clear,
+        right_widget=self._build_manual_section(),
+    )
+    self.section_tabs.addTab(manual_tab, "Section 2 - Manual Note")
+
+    # Backward-compatible alias for existing handlers that use self.log_box.
+    self.log_box = self.age_log_box
+
+
+def _tab2_tab5_style_log(self, text: str) -> None:
+    """Write logs to the active section log and keep compatibility with existing handlers."""
+    message = str(text)
+
+    targets = []
+    if hasattr(self, "section_tabs"):
+        current_index = self.section_tabs.currentIndex()
+        if current_index == 0 and hasattr(self, "age_log_box"):
+            targets.append(self.age_log_box)
+        elif current_index == 1 and hasattr(self, "manual_log_box"):
+            targets.append(self.manual_log_box)
+
+    if not targets:
+        if hasattr(self, "age_log_box"):
+            targets.append(self.age_log_box)
+        if hasattr(self, "manual_log_box"):
+            targets.append(self.manual_log_box)
+        if not targets and hasattr(self, "log_box"):
+            targets.append(self.log_box)
+
+    for box in targets:
+        box.append(message)
+        box.ensureCursorVisible()
+
+
+# Runtime method override. Original methods remain above; this only changes which GUI builder is used.
+CombinedFundPageNotesWindow._build_tab5_style_section_tab = _tab2_build_tab5_style_section_tab
+CombinedFundPageNotesWindow._build_ui = _tab2_tab5_style_build_ui
+CombinedFundPageNotesWindow.log = _tab2_tab5_style_log
+
+
+# =========================================================
+# SECTION 3 LOGIC: Exit Load Formatter (merged from exitload.py)
+# =========================================================
+import sys
+import os
+import re
+import traceback
+import html
+
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QPushButton,
+    QFileDialog,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QTextEdit,
+    QProgressBar,
+    QMessageBox,
+    QFrame,
+)
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+from pptx import Presentation
+from pptx.util import Pt
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+exit_TARGET_TABLE_NAME = "Fund Features"
+exit_OUTPUT_FILE_NAME = "Updated_Exit_Load_Format.pptx"
+
+exit_FONT_NAME = "Ubuntu"
+exit_FONT_SIZE = 6
+
+
+# =========================================================
+# TEXT HELPERS
+# =========================================================
+def exit_normalize_text(value):
+    if value is None:
+        return ""
+
+    value = str(value)
+    value = html.unescape(value)
+    value = value.replace("\r\n", "\n")
+    value = value.replace("\r", "\n")
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"[ \t]+", " ", value)
+
+    return value.strip()
+
+
+def exit_is_nil_or_na(value):
+    """
+    If Exit Load value is Nil / NA / N.A. / Not Applicable,
+    keep original text as it is.
+    """
+    value = exit_normalize_text(value).lower()
+    value = value.replace(".", "")
+    value = value.replace(":", "")
+    value = value.strip()
+
+    nil_values = {
+        "nil",
+        "na",
+        "n a",
+        "not applicable",
+        "notapplicable",
+    }
+
+    return value in nil_values
+
+
+def exit_format_exit_load_text(original_text):
+    """
+    Converts:
+        Exit Load: ► 0.25% if redeemed...
+        ► Nil if redeemed...
+
+    Into:
+        Exit Load:
+        ► 0.25% if redeemed...
+        ► Nil if redeemed...
+
+    Keeps as-is if:
+        Exit Load: Nil
+        Exit Load: NA
+        Exit Load: N.A.
+        Exit Load: Not Applicable
+    """
+
+    text = exit_normalize_text(original_text)
+
+    if "exit load" not in text.lower():
+        return text, False, "Exit Load not found"
+
+    pattern = re.compile(r"(Exit\s*Load\s*:)(.*)", re.IGNORECASE | re.DOTALL)
+    match = pattern.search(text)
+
+    if not match:
+        return text, False, "Exit Load pattern not matched"
+
+    label = match.group(1).strip()
+    after_label = match.group(2)
+
+    after_label_clean = after_label.strip()
+
+    if after_label_clean == "":
+        return text, False, "No text after Exit Load"
+
+    # Already formatted, Exit Load: already followed by next line
+    if after_label.startswith("\n"):
+        return text, False, "Already formatted"
+
+    first_line_after_label = after_label_clean.split("\n")[0].strip()
+
+    # Keep Nil / NA as-is
+    if exit_is_nil_or_na(first_line_after_label):
+        return text, False, "Nil/NA found, kept as-is"
+
+    new_text = f"{label}\n{after_label_clean}"
+
+    return new_text, True, "Exit Load points moved to next line"
+
+
+# =========================================================
+# PPT HELPERS
+# =========================================================
+def exit_iter_all_shapes(shapes):
+    """
+    Iterates normal shapes and grouped shapes.
+    """
+    for shape in shapes:
+        yield shape
+
+        if hasattr(shape, "shapes"):
+            for child_shape in exit_iter_all_shapes(shape.shapes):
+                yield child_shape
+
+
+def exit_apply_cell_text_with_font(cell, text):
+    """
+    Writes text into table cell with Ubuntu font size 6.
+    Preserves line breaks by creating separate paragraphs.
+    """
+
+    clean_text = exit_normalize_text(text)
+
+    text_frame = cell.text_frame
+    text_frame.clear()
+
+    lines = clean_text.split("\n")
+
+    for index, line in enumerate(lines):
+        if index == 0:
+            paragraph = text_frame.paragraphs[0]
+        else:
+            paragraph = text_frame.add_paragraph()
+
+        paragraph.text = ""
+
+        run = paragraph.add_run()
+        run.text = line
+        run.font.name = exit_FONT_NAME
+        run.font.size = Pt(exit_FONT_SIZE)
+
+        if line.strip().lower().startswith("exit load"):
+            run.font.bold = True
+
+
+def exit_find_fund_features_tables(prs, log_callback=None):
+    """
+    Finds all PowerPoint tables where object/shape name is 'Fund Features'.
+    """
+
+    def log(message):
+        if log_callback:
+            log_callback(str(message))
+
+    tables = []
+
+    for slide_index, slide in enumerate(prs.slides):
+        slide_no = slide_index + 1
+
+        for shape in exit_iter_all_shapes(slide.shapes):
+            try:
+                shape_name = exit_normalize_text(shape.name)
+            except Exception:
+                shape_name = ""
+
+            try:
+                has_table = shape.has_table
+            except Exception:
+                has_table = False
+
+            if not has_table:
+                continue
+
+            if shape_name.lower() == exit_TARGET_TABLE_NAME.lower():
+                tables.append(
+                    {
+                        "slide_no": slide_no,
+                        "shape_name": shape_name,
+                        "table": shape.table,
+                    }
+                )
+
+                log(f"Found '{exit_TARGET_TABLE_NAME}' table on slide {slide_no}")
+
+    return tables
+
+
+# =========================================================
+# MAIN PPT PROCESS
+# =========================================================
+def exit_process_ppt(ppt_path, output_folder, progress_callback=None, log_callback=None):
+    def log(message):
+        if log_callback:
+            log_callback(str(message))
+
+    try:
+        log("Starting Exit Load formatting process...")
+        log(f"Input PPT: {ppt_path}")
+        log(f"Output Folder: {output_folder}")
+        log(f"Target table object name: {exit_TARGET_TABLE_NAME}")
+        log(f"Font: {exit_FONT_NAME}, Size: {exit_FONT_SIZE}")
+
+        if progress_callback:
+            progress_callback(5)
+
+        log("Loading PowerPoint file...")
+        prs = Presentation(ppt_path)
+
+        if progress_callback:
+            progress_callback(20)
+
+        tables = exit_find_fund_features_tables(prs, log_callback=log)
+
+        if not tables:
+            return False, "No table found with object name 'Fund Features'."
+
+        total_tables = len(tables)
+        checked_cells = 0
+        updated_count = 0
+        skipped_count = 0
+
+        log(f"Total '{exit_TARGET_TABLE_NAME}' tables found: {total_tables}")
+
+        for table_index, table_info in enumerate(tables, start=1):
+            slide_no = table_info["slide_no"]
+            table = table_info["table"]
+
+            log("-" * 70)
+            log(f"Processing slide {slide_no}")
+
+            for row_index, row in enumerate(table.rows):
+                for cell_index, cell in enumerate(row.cells):
+                    checked_cells += 1
+
+                    original_text = exit_normalize_text(cell.text)
+
+                    if not original_text:
+                        continue
+
+                    if "exit load" not in original_text.lower():
+                        continue
+
+                    log(
+                        f"Exit Load found | Slide {slide_no}, "
+                        f"Row {row_index}, Cell {cell_index}"
+                    )
+
+                    new_text, changed, reason = exit_format_exit_load_text(original_text)
+
+                    if changed:
+                        exit_apply_cell_text_with_font(cell, new_text)
+                        updated_count += 1
+
+                        log(
+                            f"UPDATED | Slide {slide_no}, Row {row_index}, "
+                            f"Cell {cell_index} | {reason}"
+                        )
+                    else:
+                        skipped_count += 1
+
+                        log(
+                            f"SKIPPED | Slide {slide_no}, Row {row_index}, "
+                            f"Cell {cell_index} | {reason}"
+                        )
+
+            if progress_callback:
+                progress = 20 + int((table_index / total_tables) * 65)
+                progress_callback(progress)
+
+        log("-" * 70)
+        log("Saving updated PowerPoint file...")
+
+        os.makedirs(output_folder, exist_ok=True)
+        output_path = os.path.join(output_folder, exit_OUTPUT_FILE_NAME)
+
+        prs.save(output_path)
+
+        if progress_callback:
+            progress_callback(100)
+
+        log("Process completed successfully.")
+        log(f"Cells checked: {checked_cells}")
+        log(f"Exit Load cells updated: {updated_count}")
+        log(f"Exit Load cells skipped: {skipped_count}")
+        log(f"Saved file: {output_path}")
+
+        message = (
+            "Completed successfully!\n\n"
+            f"Fund Features tables found: {total_tables}\n"
+            f"Cells checked: {checked_cells}\n"
+            f"Exit Load cells updated: {updated_count}\n"
+            f"Exit Load cells skipped: {skipped_count}\n\n"
+            f"Saved at:\n{output_path}"
+        )
+
+        return True, message
+
+    except Exception:
+        error = traceback.format_exc()
+        log("ERROR occurred:")
+        log(error)
+        return False, error
+
+
+# =========================================================
+# BACKGROUND THREAD
+# =========================================================
+class exit_WorkerThread(QThread):
+    progress_signal = pyqtSignal(int)
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, ppt_path, output_folder):
+        super().__init__()
+        self.ppt_path = ppt_path
+        self.output_folder = output_folder
+
+    def run(self):
+        success, message = exit_process_ppt(
+            ppt_path=self.ppt_path,
+            output_folder=self.output_folder,
+            progress_callback=self.progress_signal.emit,
+            log_callback=self.log_signal.emit,
+        )
+
+        self.finished_signal.emit(success, message)
+
+
+# =========================================================
+# GUI APPLICATION
+# =========================================================
+class exit_App(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.ppt_path = None
+        self.output_folder = None
+        self.worker = None
+
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("Exit Load Formatter")
+        self.setMinimumSize(980, 560)
+
+        main_layout = QHBoxLayout()
+
+        # LEFT SIDE LOG
+        left_layout = QVBoxLayout()
+
+        log_title = QLabel("Process Log")
+        log_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        log_title.setStyleSheet(
+            """
+            QLabel {
+                font-size: 16px;
+                font-weight: bold;
+                padding: 6px;
+            }
+            """
+        )
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setStyleSheet(
+            """
+            QTextEdit {
+                background-color: #111111;
+                color: #00FF66;
+                font-family: Consolas;
+                font-size: 12px;
+                border-radius: 6px;
+                padding: 8px;
+            }
+            """
+        )
+
+        left_layout.addWidget(log_title)
+        left_layout.addWidget(self.log_box)
+
+        # RIGHT SIDE CONTROLS
+        right_frame = QFrame()
+        right_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        right_frame.setStyleSheet(
+            """
+            QFrame {
+                background-color: #F7F7F7;
+                border-radius: 8px;
+            }
+            """
+        )
+
+        right_layout = QVBoxLayout()
+
+        title = QLabel("Exit Load Formatter")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet(
+            """
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #222222;
+                padding: 10px;
+            }
+            """
+        )
+
+        subtitle = QLabel(
+            "Moves Exit Load points to next line in Fund Features table"
+        )
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(
+            """
+            QLabel {
+                font-size: 12px;
+                color: #555555;
+                padding-bottom: 8px;
+            }
+            """
+        )
+
+        self.lbl_ppt = QLabel("Input PPT: Not selected")
+        self.lbl_output = QLabel("Output Folder: Not selected")
+
+        for label in [self.lbl_ppt, self.lbl_output]:
+            label.setWordWrap(True)
+            label.setStyleSheet(
+                """
+                QLabel {
+                    background-color: white;
+                    padding: 7px;
+                    border: 1px solid #DDDDDD;
+                    border-radius: 5px;
+                }
+                """
+            )
+
+        self.btn_ppt = QPushButton("Select Input PPT File")
+        self.btn_output = QPushButton("Select Output Folder")
+        self.btn_run = QPushButton("Run Process")
+
+        self.progress = QProgressBar()
+        self.progress.setValue(0)
+        self.progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        normal_button_style = """
+            QPushButton {
+                background-color: #FFFFFF;
+                color: #222222;
+                padding: 9px;
+                border: 1px solid #CCCCCC;
+                border-radius: 6px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #EFEFEF;
+            }
+        """
+
+        run_button_style = """
+            QPushButton {
+                background-color: #0078D7;
+                color: white;
+                padding: 12px;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #005A9E;
+            }
+            QPushButton:disabled {
+                background-color: #999999;
+            }
+        """
+
+        self.btn_ppt.setStyleSheet(normal_button_style)
+        self.btn_output.setStyleSheet(normal_button_style)
+        self.btn_run.setStyleSheet(run_button_style)
+
+        self.btn_ppt.clicked.connect(self.select_ppt)
+        self.btn_output.clicked.connect(self.select_output)
+        self.btn_run.clicked.connect(self.run_process)
+
+        right_layout.addWidget(title)
+        right_layout.addWidget(subtitle)
+        right_layout.addSpacing(10)
+
+        right_layout.addWidget(self.btn_ppt)
+        right_layout.addWidget(self.lbl_ppt)
+
+        right_layout.addWidget(self.btn_output)
+        right_layout.addWidget(self.lbl_output)
+
+        right_layout.addSpacing(15)
+        right_layout.addWidget(self.progress)
+        right_layout.addSpacing(15)
+
+        right_layout.addWidget(self.btn_run)
+        right_layout.addStretch()
+
+        right_frame.setLayout(right_layout)
+
+        main_layout.addLayout(left_layout, 2)
+        main_layout.addWidget(right_frame, 1)
+
+        self.setLayout(main_layout)
+
+    def select_ppt(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select PowerPoint File",
+            "",
+            "PowerPoint Files (*.pptx)",
+        )
+
+        if file_path:
+            self.ppt_path = file_path
+            self.lbl_ppt.setText(f"Input PPT: {file_path}")
+            self.add_log(f"Selected PPT: {file_path}")
+
+    def select_output(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Output Folder",
+        )
+
+        if folder:
+            self.output_folder = folder
+            self.lbl_output.setText(f"Output Folder: {folder}")
+            self.add_log(f"Selected output folder: {folder}")
+
+    def run_process(self):
+        if not self.ppt_path or not self.output_folder:
+            QMessageBox.warning(
+                self,
+                "Missing Input",
+                "Please select input PPT file and output folder.",
+            )
+            return
+
+        self.progress.setValue(0)
+        self.log_box.clear()
+
+        self.add_log("Running Exit Load formatting process...")
+        self.set_buttons_enabled(False)
+
+        self.worker = exit_WorkerThread(
+            ppt_path=self.ppt_path,
+            output_folder=self.output_folder,
+        )
+
+        self.worker.progress_signal.connect(self.update_progress)
+        self.worker.log_signal.connect(self.add_log)
+        self.worker.finished_signal.connect(self.process_finished)
+
+        self.worker.start()
+
+    def update_progress(self, value):
+        self.progress.setValue(value)
+
+    def process_finished(self, success, message):
+        self.set_buttons_enabled(True)
+
+        if success:
+            self.progress.setValue(100)
+            self.add_log("Finished successfully.")
+            QMessageBox.information(self, "Success", message)
+        else:
+            self.add_log("Process failed.")
+            QMessageBox.critical(self, "Error", message)
+
+    def set_buttons_enabled(self, enabled):
+        self.btn_ppt.setEnabled(enabled)
+        self.btn_output.setEnabled(enabled)
+        self.btn_run.setEnabled(enabled)
+
+    def add_log(self, text):
+        self.log_box.append(str(text))
+        self.log_box.verticalScrollBar().setValue(
+            self.log_box.verticalScrollBar().maximum()
+        )
+
+
+# =========================================================
+# RUN APPLICATION
+# =========================================================
+if False and __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = exit_App()
+    window.show()
+    sys.exit(app.exec())
+
+
+# =========================================================
+# SECTION 4 LOGIC: Sector Allocation Automation (merged from sector.py)
+# =========================================================
+import sys
+import copy
+import pandas as pd
+from pptx import Presentation
+from pptx.util import Pt
+from pptx.enum.text import PP_ALIGN
+
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QHBoxLayout, QVBoxLayout,
+    QPushButton, QTextEdit, QLabel, QFileDialog
+)
+
+
+# ✅ FORMAT FUNCTIONS
+def sector_format_cell_left(cell, text):
+    tf = cell.text_frame
+    tf.clear()
+
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    run.text = str(text)
+
+    run.font.size = Pt(6)
+    run.font.name = "Ubuntu"
+    p.alignment = PP_ALIGN.LEFT   # ✅ LEFT ALIGN
+
+
+def sector_format_cell_center(cell, text):
+    tf = cell.text_frame
+    tf.clear()
+
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    run.text = str(text)
+
+    run.font.size = Pt(6)
+    run.font.name = "Ubuntu"
+    p.alignment = PP_ALIGN.CENTER  # ✅ CENTER ALIGN
+
+
+# ✅ SAFE ROW ADD (WILL TRY, MAY FAIL DEPENDING ON PPT)
+def sector_safe_add_row(table):
+    try:
+        tbl = table._tbl
+        if len(tbl.tr_lst) == 0:
+            return False
+
+        new_tr = copy.deepcopy(tbl.tr_lst[-1])
+        tbl.append(new_tr)
+        return True
+    except:
+        return False
+
+
+class sector_SectorAllocationApp(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Sector Allocation Automation")
+        self.resize(900, 500)
+
+        layout = QHBoxLayout()
+
+        # ✅ LEFT LOG PANEL
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+
+        # ✅ RIGHT PANEL
+        right = QVBoxLayout()
+
+        self.btn_excel = QPushButton("Select Excel File")
+        self.btn_ppt = QPushButton("Select PPT File")
+        self.btn_run = QPushButton("Run Process")
+
+        self.status = QLabel("Status: Waiting")
+
+        right.addWidget(self.btn_excel)
+        right.addWidget(self.btn_ppt)
+        right.addWidget(self.btn_run)
+        right.addWidget(self.status)
+        right.addStretch()
+
+        layout.addWidget(self.log, 2)
+        layout.addLayout(right, 1)
+
+        self.setLayout(layout)
+
+        self.excel_path = ""
+        self.ppt_path = ""
+
+        self.mapping = {
+            "bandhan financial services fund": "nifty financial services tri",
+            "bandhan healthcare fund": "bse healthcare tri"
+        }
+
+        self.btn_excel.clicked.connect(self.load_excel)
+        self.btn_ppt.clicked.connect(self.load_ppt)
+        self.btn_run.clicked.connect(self.run_process)
+
+    def log_msg(self, msg):
+        self.log.append(msg)
+
+    def load_excel(self):
+        self.excel_path, _ = QFileDialog.getOpenFileName(self, "Select Excel", "", "*.xlsx")
+        self.log_msg(f"✅ Excel Loaded: {self.excel_path}")
+
+    def load_ppt(self):
+        self.ppt_path, _ = QFileDialog.getOpenFileName(self, "Select PPT", "", "*.pptx")
+        self.log_msg(f"✅ PPT Loaded: {self.ppt_path}")
+
+    def run_process(self):
+        try:
+            self.log_msg("📊 Reading Excel...")
+
+            df = pd.read_excel(self.excel_path, engine='openpyxl')
+
+            df.columns = df.columns.str.strip()
+            df.rename(columns={
+                "AMFI_Industry": "Industry",
+                "% to Net Assets": "Weight"
+            }, inplace=True)
+
+            df["Fund Name"] = df["Fund Name"].str.strip().str.lower()
+
+            prs = Presentation(self.ppt_path)
+
+            for fund, benchmark in self.mapping.items():
+
+                self.log_msg(f"🔄 Processing: {fund}")
+
+                fund_df = df[df["Fund Name"] == fund]
+                bench_df = df[df["Fund Name"] == benchmark]
+
+                if fund_df.empty:
+                    self.log_msg(f"⚠️ No data for fund: {fund}")
+                    continue
+
+                if bench_df.empty:
+                    self.log_msg(f"⚠️ No data for benchmark: {benchmark}")
+                    continue
+
+                # ✅ GROUP DATA
+                fund_grp = fund_df.groupby("Industry")["Weight"].sum()
+                bench_grp = bench_df.groupby("Industry")["Weight"].sum()
+
+                combined = pd.DataFrame({
+                    "Weight in Fund": fund_grp,
+                    "Weight in Index": bench_grp
+                }).fillna(0)
+
+                combined["Overweight/underweight"] = (
+                    combined["Weight in Fund"] - combined["Weight in Index"]
+                )
+
+                combined = combined.reset_index()
+                combined.rename(columns={"Industry": "Sector"}, inplace=True)
+
+                combined = combined.sort_values(by="Weight in Fund", ascending=False)
+
+                slide_found = False
+
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+
+                        # ✅ FIND FUND NAME SHAPE
+                        if shape.name == "Fund Name" and shape.has_text_frame:
+                            text = shape.text_frame.text.strip().lower()
+
+                            if text == fund:
+                                slide_found = True
+
+                                for s in slide.shapes:
+                                    if s.has_table and s.name == "SectorAllocation":
+
+                                        table = s.table
+
+                                        existing_rows = len(table.rows) - 1
+                                        required_rows = len(combined)
+
+                                        # ✅ TRY TO ADD ROWS
+                                        if required_rows > existing_rows:
+                                            for _ in range(required_rows - existing_rows):
+                                                if not sector_safe_add_row(table):
+                                                    break  # stop trying
+
+                                        total_available = len(table.rows) - 1
+
+                                        # ✅ WRITE DATA
+                                        for i in range(min(len(combined), total_available)):
+                                            row = combined.iloc[i]
+
+                                            # ✅ FIRST COLUMN LEFT
+                                            sector_format_cell_left(table.cell(i + 1, 0), row["Sector"])
+
+                                            # ✅ OTHER COLUMNS CENTER
+                                            sector_format_cell_center(table.cell(i + 1, 1), f"{row['Weight in Fund']:.1f}%")
+                                            sector_format_cell_center(table.cell(i + 1, 2), f"{row['Weight in Index']:.1f}%")
+                                            sector_format_cell_center(table.cell(i + 1, 3), f"{row['Overweight/underweight']:.1f}%")
+
+                                        # ✅ CLEAR REMAINING
+                                        for i in range(len(combined), total_available):
+                                            sector_format_cell_left(table.cell(i + 1, 0), "")
+                                            sector_format_cell_center(table.cell(i + 1, 1), "")
+                                            sector_format_cell_center(table.cell(i + 1, 2), "")
+                                            sector_format_cell_center(table.cell(i + 1, 3), "")
+
+                                        self.log_msg(f"✅ Table updated for {fund}")
+
+                if not slide_found:
+                    self.log_msg(f"❌ Slide NOT found for fund: {fund}")
+
+            # ✅ SAVE
+            output_file = self.ppt_path.replace(".pptx", "_updated.pptx")
+            prs.save(output_file)
+
+            self.log_msg(f"💾 Saved: {output_file}")
+            self.status.setText("Status: Completed ✅")
+
+        except Exception as e:
+            self.log_msg(f"❌ Error: {str(e)}")
+            self.status.setText("Status: Failed ❌")
+
+
+if False and __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = sector_SectorAllocationApp()
+    window.show()
+    sys.exit(app.exec())
+
+
+# =========================================================
+# SECTION 5 LOGIC: Gold and Silver ETF Portfolio (merged from goldsilver.py)
+# =========================================================
+import sys
+import os
+import traceback
+import re
+import html
+from collections import defaultdict
+
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QPushButton, QFileDialog,
+    QVBoxLayout, QHBoxLayout, QMessageBox, QLabel,
+    QProgressBar, QTextEdit, QFrame
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+from pptx import Presentation
+from pptx.util import Pt
+from openpyxl import load_workbook
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+gold_TARGET_FUNDS = [
+    "Bandhan Gold ETF",
+    "Bandhan Silver ETF"
+]
+
+gold_OUTPUT_FILE_NAME = "Updated_Bandhan_Gold_and_Silver_ETF_Portfolio.pptx"
+gold_NAV_TOLERANCE = 0.15
+
+gold_PPT_PASTE_FONT_NAME = "Ubuntu"
+gold_PPT_PASTE_FONT_SIZE = 6
+
+
+# =========================================================
+# TEXT HELPERS
+# =========================================================
+def gold_normalize_text(value):
+    if value is None:
+        return ""
+
+    value = str(value)
+    value = html.unescape(value)
+    value = value.replace("\xa0", " ")
+    value = value.replace("\n", " ")
+    value = value.replace("\r", " ")
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
+
+
+def gold_normalize_header(value):
+    value = gold_normalize_text(value).lower()
+    value = value.replace("%", "percent")
+    value = value.replace("/", " ")
+    value = value.replace("-", " ")
+    value = value.replace("_", " ")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+
+    return value.strip()
+
+
+def gold_parse_number(value):
+    try:
+        if value is None:
+            return None
+
+        text = gold_normalize_text(value)
+        text = text.replace(",", "")
+        text = text.replace("%", "")
+        text = text.strip()
+
+        if text == "":
+            return None
+
+        return float(text)
+
+    except Exception:
+        return None
+
+
+def gold_clean_ppt_nav(value):
+    number = gold_parse_number(value)
+
+    if number is None:
+        return None
+
+    return round(number, 4)
+
+
+def gold_excel_net_asset_candidates(value):
+    if value is None:
+        return []
+
+    raw_text = gold_normalize_text(value)
+    has_percent = "%" in raw_text
+
+    number = gold_parse_number(value)
+
+    if number is None:
+        return []
+
+    candidates = set()
+
+    if has_percent:
+        candidates.add(round(number, 4))
+    else:
+        candidates.add(round(number, 4))
+
+        if abs(number) <= 1:
+            candidates.add(round(number * 100, 4))
+
+    return list(candidates)
+
+
+def gold_get_best_difference(ppt_nav, excel_value):
+    candidates = gold_excel_net_asset_candidates(excel_value)
+
+    if ppt_nav is None or not candidates:
+        return None
+
+    return min(abs(ppt_nav - candidate) for candidate in candidates)
+
+
+def gold_fund_matches(excel_fund_name, target_fund):
+    excel_fund_name = gold_normalize_text(excel_fund_name).lower()
+    target_fund = gold_normalize_text(target_fund).lower()
+
+    if target_fund in excel_fund_name:
+        return True
+
+    if "gold" in target_fund:
+        return "gold" in excel_fund_name and "etf" in excel_fund_name
+
+    if "silver" in target_fund:
+        return "silver" in excel_fund_name and "etf" in excel_fund_name
+
+    return False
+
+
+def gold_detect_fund_from_text(value):
+    for fund in gold_TARGET_FUNDS:
+        if gold_fund_matches(value, fund):
+            return fund
+
+    return None
+
+
+def gold_is_total_or_cash(value):
+    value = gold_normalize_text(value).lower()
+
+    skip_words = [
+        "total",
+        "grand total",
+        "net cash",
+        "cash equivalent",
+        "cash & other",
+        "cash and other",
+        "receivable",
+        "payable",
+        "margin",
+        "collateral",
+        "clearing"
+    ]
+
+    return any(word in value for word in skip_words)
+
+
+# =========================================================
+# PPT HELPERS
+# =========================================================
+def gold_iter_all_shapes(shapes):
+    for shape in shapes:
+        yield shape
+
+        if hasattr(shape, "shapes"):
+            for child_shape in gold_iter_all_shapes(shape.shapes):
+                yield child_shape
+
+
+def gold_get_shape_text(shape):
+    try:
+        if hasattr(shape, "text"):
+            return gold_normalize_text(shape.text)
+    except Exception:
+        pass
+
+    try:
+        if shape.has_text_frame:
+            return gold_normalize_text(shape.text_frame.text)
+    except Exception:
+        pass
+
+    return ""
+
+
+def gold_set_cell_text(cell, text):
+    """
+    Paste text into PPT cell with:
+    Font Name: Ubuntu
+    Font Size: 6
+    """
+    clean_text = gold_normalize_text(text)
+
+    text_frame = cell.text_frame
+    text_frame.clear()
+
+    paragraph = text_frame.paragraphs[0]
+    paragraph.text = ""
+
+    run = paragraph.add_run()
+    run.text = clean_text
+    run.font.name = gold_PPT_PASTE_FONT_NAME
+    run.font.size = Pt(gold_PPT_PASTE_FONT_SIZE)
+
+
+# =========================================================
+# EXCEL COLUMN DETECTION
+# =========================================================
+def gold_find_excel_columns(ws, log_callback=None):
+    def log(message):
+        if log_callback:
+            log_callback(str(message))
+
+    max_scan_rows = min(ws.max_row or 30, 30)
+    max_col = ws.max_column or 100
+
+    for row_no in range(1, max_scan_rows + 1):
+        headers = []
+
+        for col in range(1, max_col + 1):
+            raw_value = ws.cell(row=row_no, column=col).value
+
+            headers.append({
+                "index": col - 1,
+                "number": col,
+                "raw": gold_normalize_text(raw_value),
+                "norm": gold_normalize_header(raw_value)
+            })
+
+        fund_col = None
+        security_col = None
+        net_assets_col = None
+
+        for header in headers:
+            norm = header["norm"]
+
+            if fund_col is None:
+                if norm in ["fund name", "scheme name", "portfolio name"]:
+                    fund_col = header["index"]
+                elif "fund name" in norm or "scheme name" in norm or "portfolio name" in norm:
+                    fund_col = header["index"]
+
+            if security_col is None:
+                if norm in [
+                    "security name",
+                    "securities name",
+                    "name of security",
+                    "name of instrument",
+                    "instrument name"
+                ]:
+                    security_col = header["index"]
+                elif "security name" in norm:
+                    security_col = header["index"]
+
+            if net_assets_col is None:
+                if norm in [
+                    "percent to net assets",
+                    "percent to net asset",
+                    "to net assets",
+                    "percent of net assets",
+                    "percentage to net assets"
+                ]:
+                    net_assets_col = header["index"]
+                elif "to net assets" in norm:
+                    net_assets_col = header["index"]
+                elif "net assets" in norm and "percent" in norm:
+                    net_assets_col = header["index"]
+
+        if fund_col is not None and security_col is not None and net_assets_col is not None:
+            log("Excel columns detected successfully.")
+            log(f"Header row number: {row_no}")
+            log(f"Fund Name column: {fund_col + 1}")
+            log(f"Security Name column: {security_col + 1}")
+            log(f"% to Net Assets column: {net_assets_col + 1}")
+
+            return {
+                "header_row": row_no,
+                "fund_col": fund_col,
+                "security_col": security_col,
+                "net_assets_col": net_assets_col
+            }
+
+    log("WARNING: Could not detect Excel columns dynamically.")
+    log("Using fallback: Fund Name=C, Security Name=T, % to Net Assets=W")
+
+    return {
+        "header_row": 1,
+        "fund_col": 2,
+        "security_col": 19,
+        "net_assets_col": 22
+    }
+
+
+# =========================================================
+# BUILD EXCEL ROWS BY FUND
+# =========================================================
+def gold_build_excel_rows_by_fund(ws, excel_cols, log_callback=None):
+    def log(message):
+        if log_callback:
+            log_callback(str(message))
+
+    rows_by_fund = defaultdict(list)
+
+    header_row = excel_cols["header_row"]
+    fund_col = excel_cols["fund_col"]
+    security_col = excel_cols["security_col"]
+    net_assets_col = excel_cols["net_assets_col"]
+
+    max_needed_col = max(fund_col, security_col, net_assets_col) + 1
+
+    log("Building Excel rows by Fund Name...")
+    log("Searching Excel Fund Name column for Bandhan Gold ETF / Bandhan Silver ETF.")
+    log("Paste value will be Excel Security Name.")
+    log(f"PPT pasted font: {gold_PPT_PASTE_FONT_NAME}, size {gold_PPT_PASTE_FONT_SIZE}")
+
+    scanned = 0
+    matched = 0
+    skipped_samples = 0
+
+    for excel_row_no, row in enumerate(
+        ws.iter_rows(
+            min_row=header_row + 1,
+            max_col=max_needed_col,
+            values_only=True
+        ),
+        start=header_row + 1
+    ):
+        scanned += 1
+
+        fund_name = gold_normalize_text(row[fund_col]) if fund_col < len(row) else ""
+        security_name = gold_normalize_text(row[security_col]) if security_col < len(row) else ""
+        net_assets_value = row[net_assets_col] if net_assets_col < len(row) else None
+
+        if not fund_name:
+            continue
+
+        matched_fund = gold_detect_fund_from_text(fund_name)
+
+        if matched_fund not in gold_TARGET_FUNDS:
+            if skipped_samples < 5:
+                skipped_samples += 1
+                log(
+                    f"Skipped sample row {excel_row_no} | "
+                    f"Fund Name: {fund_name} | "
+                    f"Security Name: {security_name} | "
+                    f"% to Net Assets: {net_assets_value}"
+                )
+            continue
+
+        if not security_name:
+            continue
+
+        if gold_normalize_header(security_name) in [
+            "security name",
+            "securities name",
+            "name of security",
+            "name of instrument",
+            "instrument name"
+        ]:
+            continue
+
+        if gold_is_total_or_cash(security_name):
+            continue
+
+        if not gold_excel_net_asset_candidates(net_assets_value):
+            continue
+
+        rows_by_fund[matched_fund].append({
+            "excel_row": excel_row_no,
+            "fund_name": fund_name,
+            "security_name": security_name,
+            "net_assets_value": net_assets_value,
+            "used": False
+        })
+
+        matched += 1
+
+    log(f"Excel rows scanned: {scanned}")
+    log(f"Relevant Excel rows found: {matched}")
+
+    for fund in gold_TARGET_FUNDS:
+        log(f"{fund}: Matching Excel rows found = {len(rows_by_fund[fund])}")
+
+        for item in rows_by_fund[fund][:10]:
+            log(
+                f"Sample {fund} | Excel row {item['excel_row']} | "
+                f"Fund Name: {item['fund_name']} | "
+                f"Security Name: {item['security_name']} | "
+                f"% to Net Assets: {item['net_assets_value']} | "
+                f"Candidates: {gold_excel_net_asset_candidates(item['net_assets_value'])}"
+            )
+
+    return rows_by_fund
+
+
+# =========================================================
+# FIND PPT FUND SLIDES
+# =========================================================
+def gold_find_target_fund_slides(prs, log_callback=None):
+    def log(message):
+        if log_callback:
+            log_callback(str(message))
+
+    slides_by_fund = defaultdict(list)
+
+    log("Scanning PPT slides using object name 'Fund Name'...")
+
+    for slide_idx, slide in enumerate(prs.slides):
+        slide_no = slide_idx + 1
+
+        for shape in gold_iter_all_shapes(slide.shapes):
+            shape_name = gold_normalize_text(getattr(shape, "name", ""))
+
+            if shape_name.lower() != "fund name":
+                continue
+
+            shape_text = gold_get_shape_text(shape)
+            matched_fund = gold_detect_fund_from_text(shape_text)
+
+            if matched_fund in gold_TARGET_FUNDS:
+                slides_by_fund[matched_fund].append(slide_idx)
+                log(f"Matched PPT slide {slide_no}: {matched_fund}")
+                break
+
+    for fund in gold_TARGET_FUNDS:
+        if not slides_by_fund.get(fund):
+            log(f"WARNING: No PPT slide found for {fund}")
+
+    return slides_by_fund
+
+
+# =========================================================
+# PPT TABLE DETECTION
+# =========================================================
+def gold_find_ppt_header_row(table):
+    for row_idx, row in enumerate(table.rows):
+        headers = [
+            gold_normalize_text(cell.text).lower()
+            for cell in row.cells
+        ]
+
+        has_company = any(
+            "company" in header or "instrument" in header
+            for header in headers
+        )
+
+        has_nav = any("nav" in header for header in headers)
+
+        if has_company and has_nav:
+            return row_idx, headers
+
+    return None, None
+
+
+def gold_find_equity_table_on_slide(slide):
+    for shape in gold_iter_all_shapes(slide.shapes):
+        try:
+            if not shape.has_table:
+                continue
+        except Exception:
+            continue
+
+        shape_name = gold_normalize_text(getattr(shape, "name", ""))
+
+        if shape_name.lower() == "equityholdings":
+            table = shape.table
+            header_row_idx, headers = gold_find_ppt_header_row(table)
+
+            if header_row_idx is not None:
+                return table, header_row_idx, headers
+
+    for shape in gold_iter_all_shapes(slide.shapes):
+        try:
+            if not shape.has_table:
+                continue
+        except Exception:
+            continue
+
+        table = shape.table
+        header_row_idx, headers = gold_find_ppt_header_row(table)
+
+        if header_row_idx is not None:
+            return table, header_row_idx, headers
+
+    return None, None, None
+
+
+# =========================================================
+# UPDATE PPT TABLE
+# =========================================================
+def gold_update_fund_slide(slide, slide_no, fund, excel_rows, log_callback=None):
+    def log(message):
+        if log_callback:
+            log_callback(str(message))
+
+    log(f"Processing PPT slide {slide_no} for {fund}")
+
+    table, header_row_idx, headers = gold_find_equity_table_on_slide(slide)
+
+    if table is None:
+        log(f"WARNING: EquityHoldings table not found on slide {slide_no}")
+        return 0, 0
+
+    try:
+        company_idx = next(
+            i for i, header in enumerate(headers)
+            if "company" in header or "instrument" in header
+        )
+
+        nav_idx = next(
+            i for i, header in enumerate(headers)
+            if "nav" in header
+        )
+
+    except Exception:
+        log(f"WARNING: Required PPT columns not found on slide {slide_no}. Headers: {headers}")
+        return 0, 0
+
+    checked = 0
+    updated = 0
+
+    for row_idx in range(header_row_idx + 1, len(table.rows)):
+        row = table.rows[row_idx]
+
+        ppt_company = gold_normalize_text(row.cells[company_idx].text)
+        ppt_nav_text = gold_normalize_text(row.cells[nav_idx].text)
+        ppt_nav = gold_clean_ppt_nav(ppt_nav_text)
+
+        if ppt_company == "" and ppt_nav is None:
+            continue
+
+        if gold_is_total_or_cash(ppt_company):
+            continue
+
+        if ppt_nav is None:
+            continue
+
+        checked += 1
+
+        best_match = None
+        best_diff = None
+
+        for item in excel_rows:
+            if item["used"]:
+                continue
+
+            diff = gold_get_best_difference(ppt_nav, item["net_assets_value"])
+
+            if diff is None:
+                continue
+
+            if diff <= gold_NAV_TOLERANCE:
+                if best_diff is None or diff < best_diff:
+                    best_diff = diff
+                    best_match = item
+
+        if best_match:
+            gold_set_cell_text(row.cells[company_idx], best_match["security_name"])
+
+            best_match["used"] = True
+            updated += 1
+
+            log(
+                f"UPDATED | {fund} | Slide {slide_no} | PPT row {row_idx} | "
+                f"PPT % of NAV: {ppt_nav} | "
+                f"Excel % to Net Assets: {best_match['net_assets_value']} | "
+                f"Excel row: {best_match['excel_row']} | "
+                f"Pasted Security Name: {best_match['security_name']} | "
+                f"Font: {gold_PPT_PASTE_FONT_NAME} {gold_PPT_PASTE_FONT_SIZE}"
+            )
+        else:
+            closest_item = None
+            closest_diff = None
+
+            for item in excel_rows:
+                if item["used"]:
+                    continue
+
+                diff = gold_get_best_difference(ppt_nav, item["net_assets_value"])
+
+                if diff is None:
+                    continue
+
+                if closest_diff is None or diff < closest_diff:
+                    closest_diff = diff
+                    closest_item = item
+
+            if closest_item:
+                log(
+                    f"No match | {fund} | Slide {slide_no} | PPT row {row_idx} | "
+                    f"PPT % of NAV: {ppt_nav} | "
+                    f"Closest Excel row: {closest_item['excel_row']} | "
+                    f"Excel % to Net Assets: {closest_item['net_assets_value']} | "
+                    f"Diff: {round(closest_diff, 4)}"
+                )
+            else:
+                log(
+                    f"No match | {fund} | Slide {slide_no} | PPT row {row_idx} | "
+                    f"PPT % of NAV: {ppt_nav}"
+                )
+
+    return checked, updated
+
+
+# =========================================================
+# MAIN PROCESS
+# =========================================================
+def gold_process_files(ppt_path, excel_path, output_folder, progress_callback=None, log_callback=None):
+    def log(message):
+        if log_callback:
+            log_callback(str(message))
+
+    try:
+        log("Starting process for both funds...")
+        log("Excel Fund Name column -> search Bandhan Gold ETF / Bandhan Silver ETF")
+        log("Excel % to Net Assets column -> match with PPT % of NAV")
+        log("Excel Security Name column -> paste into PPT Company/Instrument")
+        log(f"PPT pasted font -> {gold_PPT_PASTE_FONT_NAME}, size {gold_PPT_PASTE_FONT_SIZE}")
+        log(f"PPT File: {ppt_path}")
+        log(f"Excel File: {excel_path}")
+        log(f"Output Folder: {output_folder}")
+
+        if progress_callback:
+            progress_callback(5)
+
+        log("Loading PowerPoint...")
+        prs = Presentation(ppt_path)
+
+        if progress_callback:
+            progress_callback(15)
+
+        log("Loading Excel in read-only mode...")
+        wb = load_workbook(
+            excel_path,
+            data_only=True,
+            read_only=True
+        )
+        ws = wb.active
+
+        if progress_callback:
+            progress_callback(25)
+
+        log("Detecting Excel columns...")
+        excel_cols = gold_find_excel_columns(ws, log_callback=log)
+
+        if progress_callback:
+            progress_callback(35)
+
+        excel_rows_by_fund = gold_build_excel_rows_by_fund(
+            ws,
+            excel_cols,
+            log_callback=log
+        )
+
+        wb.close()
+
+        if progress_callback:
+            progress_callback(55)
+
+        slides_by_fund = gold_find_target_fund_slides(
+            prs,
+            log_callback=log
+        )
+
+        if progress_callback:
+            progress_callback(65)
+
+        total_checked = 0
+        total_updated = 0
+        fund_summary = []
+
+        for fund_index, fund in enumerate(gold_TARGET_FUNDS):
+            log("=" * 90)
+            log(f"Processing fund: {fund}")
+
+            slide_indexes = slides_by_fund.get(fund, [])
+            excel_rows = excel_rows_by_fund.get(fund, [])
+
+            fund_checked = 0
+            fund_updated = 0
+
+            if not slide_indexes:
+                log(f"WARNING: No PPT slide found for {fund}")
+                fund_summary.append(f"{fund}: PPT slide not found, Rows Updated: 0")
+                continue
+
+            if not excel_rows:
+                log(f"WARNING: No matching Excel rows found for {fund}")
+                fund_summary.append(f"{fund}: No matching Excel rows found, Rows Updated: 0")
+                continue
+
+            for slide_idx in slide_indexes:
+                checked, updated = gold_update_fund_slide(
+                    slide=prs.slides[slide_idx],
+                    slide_no=slide_idx + 1,
+                    fund=fund,
+                    excel_rows=excel_rows,
+                    log_callback=log
+                )
+
+                fund_checked += checked
+                fund_updated += updated
+
+            total_checked += fund_checked
+            total_updated += fund_updated
+
+            fund_summary.append(
+                f"{fund}: Rows Checked: {fund_checked}, Rows Updated: {fund_updated}"
+            )
+
+            if progress_callback:
+                progress = 65 + int(((fund_index + 1) / len(gold_TARGET_FUNDS)) * 25)
+                progress_callback(progress)
+
+        log("=" * 90)
+        log("Saving updated PowerPoint...")
+
+        os.makedirs(output_folder, exist_ok=True)
+        output_path = os.path.join(output_folder, gold_OUTPUT_FILE_NAME)
+
+        prs.save(output_path)
+
+        if progress_callback:
+            progress_callback(100)
+
+        log("Process completed.")
+        log(f"Total Rows Checked: {total_checked}")
+        log(f"Total Rows Updated: {total_updated}")
+        log(f"Saved file: {output_path}")
+
+        message = (
+            "Completed successfully!\n\n"
+            "Fund Summary:\n"
+            + "\n".join(fund_summary)
+            + "\n\n"
+            f"Total Rows Checked: {total_checked}\n"
+            f"Total Rows Updated: {total_updated}\n\n"
+            f"Saved at:\n{output_path}"
+        )
+
+        return True, message
+
+    except Exception:
+        error = traceback.format_exc()
+        log("ERROR occurred:")
+        log(error)
+        return False, error
+
+
+# =========================================================
+# BACKGROUND THREAD
+# =========================================================
+class gold_WorkerThread(QThread):
+    progress_signal = pyqtSignal(int)
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, ppt_path, excel_path, output_folder):
+        super().__init__()
+        self.ppt_path = ppt_path
+        self.excel_path = excel_path
+        self.output_folder = output_folder
+
+    def run(self):
+        success, message = gold_process_files(
+            ppt_path=self.ppt_path,
+            excel_path=self.excel_path,
+            output_folder=self.output_folder,
+            progress_callback=self.progress_signal.emit,
+            log_callback=self.log_signal.emit
+        )
+
+        self.finished_signal.emit(success, message)
+
+
+# =========================================================
+# GUI
+# =========================================================
+class gold_App(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.ppt = None
+        self.excel = None
+        self.output = None
+        self.worker = None
+
+        self.init_ui()
+
+    def init_ui(self):
+        self.setWindowTitle("ETF Portfolio Automation")
+        self.setMinimumSize(980, 560)
+
+        main_layout = QHBoxLayout()
+
+        left_layout = QVBoxLayout()
+
+        log_title = QLabel("Process Log")
+        log_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        log_title.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                font-weight: bold;
+                padding: 6px;
+            }
+        """)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setStyleSheet("""
+            QTextEdit {
+                background-color: #111111;
+                color: #00FF66;
+                font-family: Consolas;
+                font-size: 12px;
+                border-radius: 6px;
+                padding: 8px;
+            }
+        """)
+
+        left_layout.addWidget(log_title)
+        left_layout.addWidget(self.log_box)
+
+        right_frame = QFrame()
+        right_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        right_frame.setStyleSheet("""
+            QFrame {
+                background-color: #F7F7F7;
+                border-radius: 8px;
+            }
+        """)
+
+        right_layout = QVBoxLayout()
+
+        title = QLabel("Equity Holdings Updater")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("""
+            QLabel {
+                font-size: 20px;
+                font-weight: bold;
+                color: #222222;
+                padding: 10px;
+            }
+        """)
+
+        subtitle = QLabel("Pastes Security Name with Ubuntu font size 6")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet("""
+            QLabel {
+                font-size: 12px;
+                color: #555555;
+                padding-bottom: 8px;
+            }
+        """)
+
+        self.lbl_ppt = QLabel("PPT: Not selected")
+        self.lbl_excel = QLabel("Excel: Not selected")
+        self.lbl_output = QLabel("Output: Not selected")
+
+        for label in [self.lbl_ppt, self.lbl_excel, self.lbl_output]:
+            label.setWordWrap(True)
+            label.setStyleSheet("""
+                QLabel {
+                    background-color: white;
+                    padding: 7px;
+                    border: 1px solid #DDDDDD;
+                    border-radius: 5px;
+                }
+            """)
+
+        self.btn_ppt = QPushButton("Select PPT File")
+        self.btn_excel = QPushButton("Select Excel File")
+        self.btn_output = QPushButton("Select Output Folder")
+        self.btn_run = QPushButton("Run Process for Both Funds")
+
+        self.progress = QProgressBar()
+        self.progress.setValue(0)
+        self.progress.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        normal_button_style = """
+            QPushButton {
+                background-color: #FFFFFF;
+                color: #222222;
+                padding: 9px;
+                border: 1px solid #CCCCCC;
+                border-radius: 6px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #EFEFEF;
+            }
+        """
+
+        run_button_style = """
+            QPushButton {
+                background-color: #0078D7;
+                color: white;
+                padding: 12px;
+                border-radius: 6px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #005A9E;
+            }
+            QPushButton:disabled {
+                background-color: #999999;
+            }
+        """
+
+        self.btn_ppt.setStyleSheet(normal_button_style)
+        self.btn_excel.setStyleSheet(normal_button_style)
+        self.btn_output.setStyleSheet(normal_button_style)
+        self.btn_run.setStyleSheet(run_button_style)
+
+        self.btn_ppt.clicked.connect(self.select_ppt)
+        self.btn_excel.clicked.connect(self.select_excel)
+        self.btn_output.clicked.connect(self.select_output)
+        self.btn_run.clicked.connect(self.run_process)
+
+        right_layout.addWidget(title)
+        right_layout.addWidget(subtitle)
+        right_layout.addSpacing(8)
+
+        right_layout.addWidget(self.btn_ppt)
+        right_layout.addWidget(self.lbl_ppt)
+
+        right_layout.addWidget(self.btn_excel)
+        right_layout.addWidget(self.lbl_excel)
+
+        right_layout.addWidget(self.btn_output)
+        right_layout.addWidget(self.lbl_output)
+
+        right_layout.addSpacing(12)
+        right_layout.addWidget(self.progress)
+        right_layout.addSpacing(12)
+
+        right_layout.addWidget(self.btn_run)
+        right_layout.addStretch()
+
+        right_frame.setLayout(right_layout)
+
+        main_layout.addLayout(left_layout, 2)
+        main_layout.addWidget(right_frame, 1)
+
+        self.setLayout(main_layout)
+
+    def select_ppt(self):
+        file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select PPT File",
+            "",
+            "PowerPoint Files (*.pptx)"
+        )
+
+        if file:
+            self.ppt = file
+            self.lbl_ppt.setText(f"PPT: {file}")
+            self.add_log(f"PPT selected: {file}")
+
+    def select_excel(self):
+        file, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Excel File",
+            "",
+            "Excel Files (*.xlsx)"
+        )
+
+        if file:
+            self.excel = file
+            self.lbl_excel.setText(f"Excel: {file}")
+            self.add_log(f"Excel selected: {file}")
+
+    def select_output(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Output Folder"
+        )
+
+        if folder:
+            self.output = folder
+            self.lbl_output.setText(f"Output folder: {folder}")
+            self.add_log(f"Output folder selected: {folder}")
+
+    def run_process(self):
+        if not self.ppt or not self.excel or not self.output:
+            QMessageBox.warning(
+                self,
+                "Missing Input",
+                "Please select PPT file, Excel file, and output folder."
+            )
+            return
+
+        self.progress.setValue(0)
+        self.log_box.clear()
+
+        self.add_log("Running process for both funds...")
+
+        self.set_buttons_enabled(False)
+
+        self.worker = gold_WorkerThread(
+            ppt_path=self.ppt,
+            excel_path=self.excel,
+            output_folder=self.output
+        )
+
+        self.worker.progress_signal.connect(self.update_progress)
+        self.worker.log_signal.connect(self.add_log)
+        self.worker.finished_signal.connect(self.process_finished)
+
+        self.worker.start()
+
+    def update_progress(self, value):
+        self.progress.setValue(value)
+
+    def process_finished(self, success, message):
+        self.set_buttons_enabled(True)
+
+        if success:
+            self.progress.setValue(100)
+            self.add_log("Finished successfully.")
+            QMessageBox.information(self, "Success", message)
+        else:
+            self.add_log(f"Failed: {message}")
+            QMessageBox.critical(self, "Error", message)
+
+    def set_buttons_enabled(self, enabled):
+        self.btn_ppt.setEnabled(enabled)
+        self.btn_excel.setEnabled(enabled)
+        self.btn_output.setEnabled(enabled)
+        self.btn_run.setEnabled(enabled)
+
+    def add_log(self, text):
+        self.log_box.append(str(text))
+        self.log_box.verticalScrollBar().setValue(
+            self.log_box.verticalScrollBar().maximum()
+        )
+
+
+# =========================================================
+# RUN APP
+# =========================================================
+if False and __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = gold_App()
+    window.show()
+    sys.exit(app.exec())
+
+
+# =========================================================
+# Extra Section Workers / GUIs in Tab 5 style
+# =========================================================
+class ExitLoadSourceFolderWorker(QThread):
+    progress_signal = pyqtSignal(int)
+    log_signal = pyqtSignal(str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def __init__(self, pptx_files, output_folder):
+        super().__init__()
+        self.pptx_files = [Path(p) for p in pptx_files]
+        self.output_folder = Path(output_folder)
+
+    def run(self):
+        try:
+            if not self.pptx_files:
+                self.finished_signal.emit(False, "No PPTX files found in selected source folder.")
+                return
+            self.output_folder.mkdir(parents=True, exist_ok=True)
+            total = len(self.pptx_files)
+            success_count = 0
+            failed_count = 0
+            for index, pptx_path in enumerate(self.pptx_files, start=1):
+                self.log_signal.emit("")
+                self.log_signal.emit("=" * 70)
+                self.log_signal.emit(f"[{index}/{total}] Processing: {pptx_path.name}")
+                self.log_signal.emit("=" * 70)
+                def local_progress(value):
+                    overall = int(((index - 1) / total) * 100 + (value / max(total, 1)))
+                    self.progress_signal.emit(max(0, min(100, overall)))
+                ok, message = exit_process_ppt(str(pptx_path), str(self.output_folder), progress_callback=local_progress, log_callback=self.log_signal.emit)
+                fixed_output = self.output_folder / exit_OUTPUT_FILE_NAME
+                renamed_output = self.output_folder / f"{pptx_path.stem}_exitload_updated.pptx"
+                if ok:
+                    if fixed_output.exists():
+                        if renamed_output.exists():
+                            renamed_output.unlink()
+                        fixed_output.rename(renamed_output)
+                        self.log_signal.emit(f"Saved renamed file: {renamed_output}")
+                    success_count += 1
+                else:
+                    failed_count += 1
+                    self.log_signal.emit(f"FAILED: {message}")
+                self.progress_signal.emit(int((index / total) * 100))
+            summary = f"Exit Load batch completed.\n\nTotal PPTX files: {total}\nSuccessful: {success_count}\nFailed: {failed_count}\n\nOutput folder:\n{self.output_folder}"
+            self.finished_signal.emit(success_count > 0, summary)
+        except Exception:
+            error = traceback.format_exc()
+            self.log_signal.emit(error)
+            self.finished_signal.emit(False, error)
+
+
+class ExitLoadSourceFolderSection(QWidget):
+    def __init__(self, state: Any | None = None, external_log_box: QTextEdit | None = None):
+        super().__init__()
+        self.state = state
+        self.external_log_box = external_log_box
+        self.worker = None
+        self.pptx_files = []
+        self._build_ui()
+        self._apply_default_output_folder()
+
+    def _app_run_folder(self) -> Path:
+        return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+    def _default_output_folder(self) -> Path:
+        state_folder = None
+        if self.state is not None:
+            state_folder = (
+                getattr(self.state, "tab2_section4_exitload_folder", None)
+                or getattr(self.state, "tab2_exitload_folder", None)
+                or getattr(self.state, "tab2_section3_exitload_folder", None)
+            )
+        if state_folder:
+            folder = Path(state_folder)
+        else:
+            output_root = getattr(self.state, "output_root", None) if self.state is not None else None
+            folder = (Path(output_root) if output_root else self._app_run_folder() / "output") / "04_exitload_updated"
+        folder.mkdir(parents=True, exist_ok=True)
+        if self.state is not None:
+            setattr(self.state, "tab2_section4_exitload_folder", folder)
+            setattr(self.state, "tab2_exitload_folder", folder)
+            setattr(self.state, "tab2_section3_exitload_folder", folder)
+        return folder
+
+    def _apply_default_output_folder(self):
+        if not self.output_folder_edit.text().strip():
+            self.output_folder_edit.setText(str(self._default_output_folder()))
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        title = QLabel("Exit Load Formatter")
+        title.setStyleSheet("font-weight: bold; font-size: 18px;")
+        desc = QLabel("Section 3: Select a PPT source folder. The tool detects PPTX files and formats Exit Load text in Fund Features tables.")
+        desc.setWordWrap(True)
+        layout.addWidget(title); layout.addWidget(desc)
+        source_group = QGroupBox("1. Source Folder / Auto Detect")
+        source_layout = QVBoxLayout(source_group)
+        source_row = QHBoxLayout()
+        self.source_folder_edit = QLineEdit()
+        self.btn_browse_source = QPushButton("Browse PPT Source Folder...")
+        self.btn_refresh = QPushButton("Refresh Detected PPTs")
+        source_row.addWidget(QLabel("PPT Source Folder:")); source_row.addWidget(self.source_folder_edit); source_row.addWidget(self.btn_browse_source); source_row.addWidget(self.btn_refresh)
+        source_layout.addLayout(source_row)
+        self.detected_ppts_box = QTextEdit(); self.detected_ppts_box.setReadOnly(True); self.detected_ppts_box.setMinimumHeight(90)
+        source_layout.addWidget(QLabel("Detected PPT Files:")); source_layout.addWidget(self.detected_ppts_box)
+        layout.addWidget(source_group)
+        output_group = QGroupBox("2. Output")
+        output_layout = QHBoxLayout(output_group)
+        self.output_folder_edit = QLineEdit(); self.btn_browse_output = QPushButton("Browse Output Folder...")
+        output_layout.addWidget(QLabel("Output Folder:")); output_layout.addWidget(self.output_folder_edit); output_layout.addWidget(self.btn_browse_output)
+        layout.addWidget(output_group)
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        self.status_label = QLabel("Idle"); self.progress = QProgressBar(); self.progress.setValue(0)
+        progress_layout.addWidget(self.status_label); progress_layout.addWidget(self.progress)
+        layout.addWidget(progress_group)
+        run_row = QHBoxLayout(); run_row.addStretch(1); self.btn_run = QPushButton("Run Exit Load Update For Detected PPTs"); run_row.addWidget(self.btn_run)
+        layout.addLayout(run_row); layout.addStretch(1)
+        self.btn_browse_source.clicked.connect(self.browse_source_folder); self.btn_refresh.clicked.connect(self.refresh_detected_ppts); self.btn_browse_output.clicked.connect(self.browse_output_folder); self.btn_run.clicked.connect(self.run_process)
+
+    def log(self, message):
+        if self.external_log_box is not None:
+            self.external_log_box.append(str(message)); self.external_log_box.ensureCursorVisible()
+
+    def browse_source_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose PPT Source Folder", self.source_folder_edit.text().strip() or str(Path.cwd()))
+        if folder:
+            self.source_folder_edit.setText(folder); self.refresh_detected_ppts()
+
+    def refresh_detected_ppts(self):
+        source_text = self.source_folder_edit.text().strip()
+        if not source_text:
+            self.detected_ppts_box.setPlainText("Please select a PPT source folder."); return
+        source_folder = Path(source_text)
+        if not source_folder.exists() or not source_folder.is_dir():
+            self.detected_ppts_box.setPlainText("Source folder does not exist."); return
+        self.pptx_files = sorted([p for p in source_folder.rglob("*.pptx") if p.is_file() and not p.name.startswith("~$")], key=lambda p: str(p).lower())
+        if not self.pptx_files:
+            self.detected_ppts_box.setPlainText("No PPTX files found in selected source folder."); self.log("[ExitLoad] No PPTX files found."); return
+        self.detected_ppts_box.setPlainText("\n".join(p.name for p in self.pptx_files))
+        self.log(f"[ExitLoad] Detected {len(self.pptx_files)} PPTX file(s) from source folder.")
+        for pptx_path in self.pptx_files: self.log(f"  - {pptx_path.name}")
+
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose Exit Load Output Folder", self.output_folder_edit.text().strip() or str(self._default_output_folder()))
+        if folder: self.output_folder_edit.setText(folder)
+
+    def run_process(self):
+        if not self.source_folder_edit.text().strip(): QMessageBox.warning(self, "Missing Source Folder", "Please select PPT source folder."); return
+        if not self.output_folder_edit.text().strip(): QMessageBox.warning(self, "Missing Output Folder", "Please select output folder."); return
+        self.refresh_detected_ppts()
+        if not self.pptx_files: QMessageBox.warning(self, "No PPTX Files", "No PPTX files were detected in selected source folder."); return
+        if self.external_log_box is not None: self.external_log_box.clear()
+        self.progress.setValue(0); self.status_label.setText("Running..."); self.btn_run.setEnabled(False)
+        self.worker = ExitLoadSourceFolderWorker(self.pptx_files, self.output_folder_edit.text().strip())
+        self.worker.progress_signal.connect(self.progress.setValue); self.worker.log_signal.connect(self.log); self.worker.finished_signal.connect(self.on_finished); self.worker.start()
+
+    def on_finished(self, success, message):
+        self.btn_run.setEnabled(True); self.status_label.setText("Completed" if success else "Failed")
+        if success: self.progress.setValue(100); QMessageBox.information(self, "Done", message)
+        else: QMessageBox.critical(self, "Failed", message)
+
+
+class SectorAllocationSection(QWidget):
+    def __init__(self, state: Any | None = None, external_log_box: QTextEdit | None = None):
+        super().__init__()
+        self.state = state
+        self.external_log_box = external_log_box
+        self.excel_path = ""
+        self.ppt_path = ""
+        self.mapping = {
+            "bandhan financial services fund": "nifty financial services tri",
+            "bandhan healthcare fund": "bse healthcare tri",
+        }
+        self._build_ui()
+        self._apply_default_output_folder()
+
+    def _app_run_folder(self) -> Path:
+        return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+    def _default_output_folder(self) -> Path:
+        state_folder = None
+        if self.state is not None:
+            state_folder = (
+                getattr(self.state, "tab2_section5_sector_allocation_folder", None)
+                or getattr(self.state, "tab2_sector_allocation_folder", None)
+                or getattr(self.state, "tab2_section4_sector_allocation_folder", None)
+            )
+
+        if state_folder:
+            folder = Path(state_folder)
+        else:
+            output_root = getattr(self.state, "output_root", None) if self.state is not None else None
+            folder = (Path(output_root) if output_root else self._app_run_folder() / "output") / "05_sector_allocation_updated"
+
+        folder.mkdir(parents=True, exist_ok=True)
+        if self.state is not None:
+            setattr(self.state, "tab2_section5_sector_allocation_folder", folder)
+            setattr(self.state, "tab2_sector_allocation_folder", folder)
+        return folder
+
+    def _apply_default_output_folder(self):
+        if hasattr(self, "output_folder_edit") and not self.output_folder_edit.text().strip():
+            self.output_folder_edit.setText(str(self._default_output_folder()))
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Sector Allocation Automation")
+        title.setStyleSheet("font-weight: bold; font-size: 18px;")
+        desc = QLabel("Section 5: Updates SectorAllocation tables in PPT using Excel sector/industry data.")
+        desc.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(desc)
+
+        input_group = QGroupBox("1. Input Files")
+        input_layout = QVBoxLayout(input_group)
+
+        excel_row = QHBoxLayout()
+        self.excel_edit = QLineEdit()
+        self.btn_excel = QPushButton("Browse Excel File...")
+        excel_row.addWidget(QLabel("Excel File:"))
+        excel_row.addWidget(self.excel_edit)
+        excel_row.addWidget(self.btn_excel)
+
+        ppt_row = QHBoxLayout()
+        self.ppt_edit = QLineEdit()
+        self.btn_ppt = QPushButton("Browse PPT File...")
+        ppt_row.addWidget(QLabel("PPT File:"))
+        ppt_row.addWidget(self.ppt_edit)
+        ppt_row.addWidget(self.btn_ppt)
+
+        input_layout.addLayout(excel_row)
+        input_layout.addLayout(ppt_row)
+        layout.addWidget(input_group)
+
+        output_group = QGroupBox("2. Output Root / Save Folder")
+        output_layout = QHBoxLayout(output_group)
+        self.output_folder_edit = QLineEdit()
+        self.btn_output_folder = QPushButton("Browse Output Folder...")
+        output_layout.addWidget(QLabel("Output Folder:"))
+        output_layout.addWidget(self.output_folder_edit)
+        output_layout.addWidget(self.btn_output_folder)
+        layout.addWidget(output_group)
+
+        settings_group = QGroupBox("3. Mapping")
+        settings_layout = QVBoxLayout(settings_group)
+        mapping_note = QLabel(
+            "Backend mapping: Bandhan Financial Services Fund → Nifty Financial Services TRI; "
+            "Bandhan Healthcare Fund → BSE Healthcare TRI."
+        )
+        mapping_note.setWordWrap(True)
+        settings_layout.addWidget(mapping_note)
+        layout.addWidget(settings_group)
+
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        self.status_label = QLabel("Idle")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        progress_layout.addWidget(self.status_label)
+        progress_layout.addWidget(self.progress)
+        layout.addWidget(progress_group)
+
+        run_row = QHBoxLayout()
+        run_row.addStretch(1)
+        self.btn_run = QPushButton("Run Sector Allocation Update")
+        run_row.addWidget(self.btn_run)
+        layout.addLayout(run_row)
+        layout.addStretch(1)
+
+        self.btn_excel.clicked.connect(self.load_excel)
+        self.btn_ppt.clicked.connect(self.load_ppt)
+        self.btn_output_folder.clicked.connect(self.browse_output_folder)
+        self.btn_run.clicked.connect(self.run_process)
+
+    def log_msg(self, msg):
+        if self.external_log_box is not None:
+            self.external_log_box.append(str(msg))
+            self.external_log_box.ensureCursorVisible()
+
+    def load_excel(self):
+        self.excel_path, _ = QFileDialog.getOpenFileName(self, "Select Excel", "", "Excel Files (*.xlsx)")
+        if self.excel_path:
+            self.excel_edit.setText(self.excel_path)
+            self.log_msg(f"Excel Loaded: {self.excel_path}")
+
+    def load_ppt(self):
+        self.ppt_path, _ = QFileDialog.getOpenFileName(self, "Select PPT", "", "PowerPoint Files (*.pptx)")
+        if self.ppt_path:
+            self.ppt_edit.setText(self.ppt_path)
+            self.log_msg(f"PPT Loaded: {self.ppt_path}")
+
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Sector Allocation Output Folder",
+            self.output_folder_edit.text().strip() or str(self._default_output_folder()),
+        )
+        if folder:
+            self.output_folder_edit.setText(folder)
+            if self.state is not None:
+                setattr(self.state, "tab2_section5_sector_allocation_folder", Path(folder))
+                setattr(self.state, "tab2_sector_allocation_folder", Path(folder))
+            self.log_msg(f"Output Folder Selected: {folder}")
+
+    def run_process(self):
+        self.excel_path = self.excel_edit.text().strip()
+        self.ppt_path = self.ppt_edit.text().strip()
+        output_folder = self.output_folder_edit.text().strip()
+
+        if not self.excel_path:
+            QMessageBox.warning(self, "Missing Excel", "Please select Excel file.")
+            return
+        if not self.ppt_path:
+            QMessageBox.warning(self, "Missing PPT", "Please select PPT file.")
+            return
+        if not output_folder:
+            QMessageBox.warning(self, "Missing Output Folder", "Please select output folder.")
+            return
+        if not Path(self.excel_path).exists():
+            QMessageBox.warning(self, "Invalid Excel", "Selected Excel file does not exist.")
+            return
+        if not Path(self.ppt_path).exists():
+            QMessageBox.warning(self, "Invalid PPT", "Selected PPT file does not exist.")
+            return
+
+        try:
+            if self.external_log_box is not None:
+                self.external_log_box.clear()
+            self.progress.setValue(0)
+            self.status_label.setText("Running...")
+            self.btn_run.setEnabled(False)
+            self.log_msg("Reading Excel...")
+
+            df = pd.read_excel(self.excel_path, engine="openpyxl")
+            self.progress.setValue(10)
+
+            df.columns = df.columns.str.strip()
+            df.rename(columns={
+                "AMFI_Industry": "Industry",
+                "% to Net Assets": "Weight",
+            }, inplace=True)
+
+            df["Fund Name"] = df["Fund Name"].str.strip().str.lower()
+
+            prs = Presentation(self.ppt_path)
+            self.progress.setValue(25)
+
+            total_funds = len(self.mapping)
+            processed_funds = 0
+
+            for fund, benchmark in self.mapping.items():
+                self.log_msg(f"Processing: {fund}")
+
+                fund_df = df[df["Fund Name"] == fund]
+                bench_df = df[df["Fund Name"] == benchmark]
+
+                if fund_df.empty:
+                    self.log_msg(f"No data for fund: {fund}")
+                    processed_funds += 1
+                    continue
+
+                if bench_df.empty:
+                    self.log_msg(f"No data for benchmark: {benchmark}")
+                    processed_funds += 1
+                    continue
+
+                fund_grp = fund_df.groupby("Industry")["Weight"].sum()
+                bench_grp = bench_df.groupby("Industry")["Weight"].sum()
+
+                combined = pd.DataFrame({
+                    "Weight in Fund": fund_grp,
+                    "Weight in Index": bench_grp,
+                }).fillna(0)
+
+                combined["Overweight/underweight"] = combined["Weight in Fund"] - combined["Weight in Index"]
+                combined = combined.reset_index()
+                combined.rename(columns={"Industry": "Sector"}, inplace=True)
+                combined = combined.sort_values(by="Weight in Fund", ascending=False)
+
+                slide_found = False
+
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if shape.name == "Fund Name" and shape.has_text_frame and shape.text_frame.text.strip().lower() == fund:
+                            slide_found = True
+                            for s in slide.shapes:
+                                if s.has_table and s.name == "SectorAllocation":
+                                    table = s.table
+                                    existing_rows = len(table.rows) - 1
+                                    required_rows = len(combined)
+
+                                    if required_rows > existing_rows:
+                                        for _ in range(required_rows - existing_rows):
+                                            if not sector_safe_add_row(table):
+                                                break
+
+                                    total_available = len(table.rows) - 1
+
+                                    for i in range(min(len(combined), total_available)):
+                                        row = combined.iloc[i]
+                                        sector_format_cell_left(table.cell(i + 1, 0), row["Sector"])
+                                        sector_format_cell_center(table.cell(i + 1, 1), f"{row['Weight in Fund']:.1f}%")
+                                        sector_format_cell_center(table.cell(i + 1, 2), f"{row['Weight in Index']:.1f}%")
+                                        sector_format_cell_center(table.cell(i + 1, 3), f"{row['Overweight/underweight']:.1f}%")
+
+                                    for i in range(len(combined), total_available):
+                                        sector_format_cell_left(table.cell(i + 1, 0), "")
+                                        sector_format_cell_center(table.cell(i + 1, 1), "")
+                                        sector_format_cell_center(table.cell(i + 1, 2), "")
+                                        sector_format_cell_center(table.cell(i + 1, 3), "")
+
+                                    self.log_msg(f"Table updated for {fund}")
+
+                if not slide_found:
+                    self.log_msg(f"Slide NOT found for fund: {fund}")
+
+                processed_funds += 1
+                self.progress.setValue(25 + int((processed_funds / max(total_funds, 1)) * 60))
+
+            output_folder_path = Path(output_folder)
+            output_folder_path.mkdir(parents=True, exist_ok=True)
+            output_file = output_folder_path / f"{Path(self.ppt_path).stem}_sector_allocation_updated.pptx"
+            prs.save(str(output_file))
+
+            self.progress.setValue(100)
+            self.log_msg(f"Saved: {output_file}")
+            self.status_label.setText("Completed")
+            QMessageBox.information(self, "Done", f"Sector Allocation updated successfully.\n\nSaved file:\n{output_file}")
+
+        except Exception as e:
+            self.log_msg(f"Error: {str(e)}")
+            self.status_label.setText("Failed")
+            QMessageBox.critical(self, "Failed", str(e))
+        finally:
+            self.btn_run.setEnabled(True)
+
+
+class GoldSilverETFSection(QWidget):
+    def __init__(self, state: Any | None = None, external_log_box: QTextEdit | None = None):
+        super().__init__()
+        self.state = state; self.external_log_box = external_log_box; self.worker = None
+        self.ppt_path = ""; self.excel_path = ""
+        self._build_ui(); self._apply_default_output_folder()
+
+    def _app_run_folder(self) -> Path:
+        return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+    def _default_output_folder(self) -> Path:
+        state_folder = None
+        if self.state is not None:
+            state_folder = (
+                getattr(self.state, "tab2_section6_gold_silver_etf_folder", None)
+                or getattr(self.state, "tab2_gold_silver_etf_folder", None)
+                or getattr(self.state, "tab2_section5_gold_silver_etf_folder", None)
+            )
+        if state_folder:
+            folder = Path(state_folder)
+        else:
+            output_root = getattr(self.state, "output_root", None) if self.state is not None else None
+            folder = (Path(output_root) if output_root else self._app_run_folder() / "output") / "06_gold_silver_etf_updated"
+        folder.mkdir(parents=True, exist_ok=True)
+        if self.state is not None:
+            setattr(self.state, "tab2_section6_gold_silver_etf_folder", folder)
+            setattr(self.state, "tab2_gold_silver_etf_folder", folder)
+            setattr(self.state, "tab2_section5_gold_silver_etf_folder", folder)
+        return folder
+
+    def _apply_default_output_folder(self):
+        if not self.output_folder_edit.text().strip(): self.output_folder_edit.setText(str(self._default_output_folder()))
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        title = QLabel("Gold and Silver ETF Portfolio Updater"); title.setStyleSheet("font-weight: bold; font-size: 18px;")
+        desc = QLabel("Section 5: Updates Bandhan Gold ETF and Bandhan Silver ETF portfolio tables in PPT. Reads Excel security rows, matches % of NAV, and pastes Security Name with Ubuntu font size 6."); desc.setWordWrap(True)
+        layout.addWidget(title); layout.addWidget(desc)
+        input_group = QGroupBox("1. Input Files"); input_layout = QVBoxLayout(input_group)
+        ppt_row = QHBoxLayout(); self.ppt_edit = QLineEdit(); self.btn_ppt = QPushButton("Browse PPT File..."); ppt_row.addWidget(QLabel("PPT File:")); ppt_row.addWidget(self.ppt_edit); ppt_row.addWidget(self.btn_ppt)
+        excel_row = QHBoxLayout(); self.excel_edit = QLineEdit(); self.btn_excel = QPushButton("Browse Excel File..."); excel_row.addWidget(QLabel("Excel File:")); excel_row.addWidget(self.excel_edit); excel_row.addWidget(self.btn_excel)
+        input_layout.addLayout(ppt_row); input_layout.addLayout(excel_row); layout.addWidget(input_group)
+        output_group = QGroupBox("2. Output"); output_layout = QHBoxLayout(output_group); self.output_folder_edit = QLineEdit(); self.btn_output = QPushButton("Browse Output Folder...")
+        output_layout.addWidget(QLabel("Output Folder:")); output_layout.addWidget(self.output_folder_edit); output_layout.addWidget(self.btn_output); layout.addWidget(output_group)
+        progress_group = QGroupBox("Progress"); progress_layout = QVBoxLayout(progress_group); self.status_label = QLabel("Idle"); self.progress = QProgressBar(); self.progress.setRange(0, 100); self.progress.setValue(0)
+        progress_layout.addWidget(self.status_label); progress_layout.addWidget(self.progress); layout.addWidget(progress_group)
+        run_row = QHBoxLayout(); run_row.addStretch(1); self.btn_run = QPushButton("Run Gold and Silver ETF Update"); run_row.addWidget(self.btn_run); layout.addLayout(run_row); layout.addStretch(1)
+        self.btn_ppt.clicked.connect(self.browse_ppt); self.btn_excel.clicked.connect(self.browse_excel); self.btn_output.clicked.connect(self.browse_output_folder); self.btn_run.clicked.connect(self.run_process)
+
+    def log(self, message):
+        if self.external_log_box is not None: self.external_log_box.append(str(message)); self.external_log_box.ensureCursorVisible()
+
+    def browse_ppt(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select PPT File", "", "PowerPoint Files (*.pptx)")
+        if file_path: self.ppt_path = file_path; self.ppt_edit.setText(file_path); self.log(f"Selected PPT: {file_path}")
+
+    def browse_excel(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Excel File", "", "Excel Files (*.xlsx *.xlsm)")
+        if file_path: self.excel_path = file_path; self.excel_edit.setText(file_path); self.log(f"Selected Excel: {file_path}")
+
+    def browse_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder", self.output_folder_edit.text().strip() or str(self._default_output_folder()))
+        if folder: self.output_folder_edit.setText(folder); self.log(f"Selected output folder: {folder}")
+
+    def run_process(self):
+        self.ppt_path = self.ppt_edit.text().strip(); self.excel_path = self.excel_edit.text().strip(); output_folder = self.output_folder_edit.text().strip()
+        if not self.ppt_path: QMessageBox.warning(self, "Missing PPT", "Please select PPT file."); return
+        if not self.excel_path: QMessageBox.warning(self, "Missing Excel", "Please select Excel file."); return
+        if not output_folder: QMessageBox.warning(self, "Missing Output Folder", "Please select output folder."); return
+        if not Path(self.ppt_path).exists(): QMessageBox.warning(self, "Invalid PPT", "Selected PPT file does not exist."); return
+        if not Path(self.excel_path).exists(): QMessageBox.warning(self, "Invalid Excel", "Selected Excel file does not exist."); return
+        if self.external_log_box is not None: self.external_log_box.clear()
+        self.progress.setValue(0); self.status_label.setText("Running..."); self.btn_run.setEnabled(False); self.log("Running Gold and Silver ETF portfolio update...")
+        self.worker = gold_WorkerThread(ppt_path=self.ppt_path, excel_path=self.excel_path, output_folder=output_folder)
+        self.worker.progress_signal.connect(self.progress.setValue); self.worker.log_signal.connect(self.log); self.worker.finished_signal.connect(self.on_finished); self.worker.start()
+
+    def on_finished(self, success, message):
+        self.btn_run.setEnabled(True); self.status_label.setText("Completed" if success else "Failed")
+        if success: self.progress.setValue(100); QMessageBox.information(self, "Done", message)
+        else: QMessageBox.critical(self, "Failed", message)
+
+
+def _combined_sections_build_tab(self, log_box: QTextEdit, clear_handler: Callable[[], None], right_widget: QWidget) -> QWidget:
+    tab = QWidget(); main_layout = QHBoxLayout(tab); main_layout.setContentsMargins(6, 6, 6, 6); main_layout.setSpacing(8)
+    left_widget = QWidget(); left_layout = QVBoxLayout(left_widget); left_layout.setContentsMargins(6, 6, 6, 6); left_layout.setSpacing(8)
+    log_title = QLabel("Process Logs"); log_title.setStyleSheet("font-weight: bold; font-size: 13px;"); left_layout.addWidget(log_title)
+    log_box.setReadOnly(True); left_layout.addWidget(log_box, stretch=1)
+    clear_btn = QPushButton("Clear Log"); clear_btn.clicked.connect(clear_handler); left_layout.addWidget(clear_btn)
+    left_widget.setMinimumWidth(380); left_widget.setMaximumWidth(420)
+    scroll = QScrollArea(); scroll.setWidgetResizable(True); panel = QWidget(); right_layout = QVBoxLayout(panel); right_layout.setContentsMargins(6, 6, 12, 6); right_layout.setSpacing(10); right_layout.addWidget(right_widget); right_layout.addStretch(1); scroll.setWidget(panel)
+    main_layout.addWidget(left_widget); main_layout.addWidget(scroll, stretch=1); return tab
+
+
+def _combined5_build_ui(self):
+    self.setWindowTitle("Combined Fund Page Notes / Exit Load / Sector / ETF")
+    root = QVBoxLayout(self); root.setContentsMargins(6, 6, 6, 6); root.setSpacing(8)
+    title = QLabel("Fund Page Notes / Exit Load / Sector / ETF"); title.setStyleSheet("font-weight: bold; font-size: 18px;")
+    desc = QLabel("Section 1: Age-Based Fund Page Notes. Section 2: Manual Fund Page Note. Section 3: Exit Load Formatter. Section 4: Sector Allocation Automation. Section 5: Gold and Silver ETF Portfolio."); desc.setWordWrap(True)
+    root.addWidget(title); root.addWidget(desc)
+    self.section_tabs = QTabWidget(); root.addWidget(self.section_tabs, stretch=1)
+    self.age_log_box = QTextEdit(); self.section_tabs.addTab(self._build_tab5_style_section_tab(self.age_log_box, self.age_log_box.clear, self._build_age_based_section()), "Section 1 - Age-Based Notes")
+    self.manual_log_box = QTextEdit(); self.section_tabs.addTab(self._build_tab5_style_section_tab(self.manual_log_box, self.manual_log_box.clear, self._build_manual_section()), "Section 2 - Manual Note")
+    self.exitload_log_box = QTextEdit(); self.section_tabs.addTab(self._build_tab5_style_section_tab(self.exitload_log_box, self.exitload_log_box.clear, ExitLoadSourceFolderSection(self.state, self.exitload_log_box)), "Section 3 - Exit Load")
+    self.sector_log_box = QTextEdit(); self.section_tabs.addTab(self._build_tab5_style_section_tab(self.sector_log_box, self.sector_log_box.clear, SectorAllocationSection(self.sector_log_box)), "Section 4 - Sector Allocation")
+    self.gold_silver_log_box = QTextEdit(); self.section_tabs.addTab(self._build_tab5_style_section_tab(self.gold_silver_log_box, self.gold_silver_log_box.clear, GoldSilverETFSection(self.state, self.gold_silver_log_box)), "Section 5 - Gold/Silver ETF")
+    self.log_box = self.age_log_box
+
+
+def _combined5_log(self, text: str) -> None:
+    message = str(text); targets = []
+    if hasattr(self, "section_tabs"):
+        idx = self.section_tabs.currentIndex()
+        if idx == 0 and hasattr(self, "age_log_box"): targets.append(self.age_log_box)
+        elif idx == 1 and hasattr(self, "manual_log_box"): targets.append(self.manual_log_box)
+        elif idx == 2 and hasattr(self, "exitload_log_box"): targets.append(self.exitload_log_box)
+        elif idx == 3 and hasattr(self, "sector_log_box"): targets.append(self.sector_log_box)
+        elif idx == 4 and hasattr(self, "gold_silver_log_box"): targets.append(self.gold_silver_log_box)
+    if not targets and hasattr(self, "log_box"): targets.append(self.log_box)
+    for box in targets: box.append(message); box.ensureCursorVisible()
+
+
+CombinedFundPageNotesWindow._build_tab5_style_section_tab = _combined_sections_build_tab
+CombinedFundPageNotesWindow._build_ui = _combined5_build_ui
+CombinedFundPageNotesWindow.log = _combined5_log
+Tab2Widget = CombinedFundPageNotesWindow
+CombinedFundPageNotesExitLoadSectorGoldSilverWidget = CombinedFundPageNotesWindow
+ExitLoadSectionWidget = ExitLoadSourceFolderSection
+SectorSectionWidget = SectorAllocationSection
+GoldSilverETFSectionWidget = GoldSilverETFSection
+
+
+# =========================================================
+# SECTION 1 LOGIC + GUI: PPTX / PDF Merger with Output Folder
+# =========================================================
+import shutil
+import tempfile
+from PyQt6.QtWidgets import QListWidget, QListWidgetItem, QRadioButton, QButtonGroup
+
+
+def merge_pptx_files(input_paths: list[str], output_path: str) -> None:
+    """Merge PPTX files into one PPTX using Microsoft PowerPoint COM.
+
+    Fix for the error shown in the app:
+        PowerPoint/COM error: Application.Visible : Invalid request. Hiding the application window is not allowed.
+        python-pptx-merger error: 'str' object has no attribute 'getvalue'
+
+    The reliable fix is:
+    1. Do NOT hide PowerPoint. Keep ppt.Visible = True.
+    2. Use PowerPoint's native Slides.InsertFromFile method for PPTX merging.
+    3. Use python-pptx-merger only as a last fallback, with safe type handling.
+
+    Notes:
+    - The merged PPTX uses the first PPTX file's slide size/theme as the output deck base.
+    - Microsoft PowerPoint must be installed for the COM method.
+    """
+    if not input_paths:
+        raise ValueError("No input files selected.")
+
+    normalized_inputs: list[str] = []
+    for raw_path in input_paths:
+        pptx_path = Path(raw_path).resolve()
+        if not pptx_path.is_file():
+            raise FileNotFoundError(f"Input file not found: {pptx_path}")
+        if pptx_path.suffix.lower() != ".pptx":
+            raise ValueError(f"Not a PPTX file: {pptx_path}")
+        normalized_inputs.append(str(pptx_path))
+
+    output_obj = Path(output_path).resolve()
+    output_obj.parent.mkdir(parents=True, exist_ok=True)
+
+    # If output exists, remove it first. PowerPoint can fail silently when saving over a locked/old file.
+    if output_obj.exists():
+        try:
+            output_obj.unlink()
+        except Exception as exc:
+            raise RuntimeError(f"Cannot overwrite output file. Please close it if open: {output_obj}\n{exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Preferred method: Microsoft PowerPoint COM
+    # ------------------------------------------------------------------
+    com_error_text = ""
+    try:
+        import win32com.client
+
+        ppt = win32com.client.Dispatch("PowerPoint.Application")
+
+        # IMPORTANT FIX:
+        # Do not set ppt.Visible = 0. Some PowerPoint installations reject hiding the application:
+        # "Application.Visible : Invalid request. Hiding the application window is not allowed."
+        ppt.Visible = True
+
+        presentation = None
+        try:
+            # Open the first deck as the base deck. WithWindow=True is more reliable with Visible=True.
+            presentation = ppt.Presentations.Open(
+                normalized_inputs[0],
+                ReadOnly=False,
+                Untitled=False,
+                WithWindow=True,
+            )
+
+            # Insert every remaining deck after the last slide of the base deck.
+            for next_pptx in normalized_inputs[1:]:
+                presentation.Slides.InsertFromFile(next_pptx, presentation.Slides.Count)
+
+            # 24 = ppSaveAsOpenXMLPresentation (.pptx)
+            presentation.SaveAs(str(output_obj), 24)
+
+        finally:
+            if presentation is not None:
+                presentation.Close()
+            ppt.Quit()
+
+        if output_obj.exists() and output_obj.stat().st_size > 0:
+            return
+
+        raise RuntimeError(f"PowerPoint merge completed, but output file was not created: {output_obj}")
+
+    except Exception as com_exc:
+        com_error_text = str(com_exc)
+
+    # ------------------------------------------------------------------
+    # Fallback method: python-pptx-merger
+    # This is kept only as fallback. Some versions fail internally with:
+    # 'str' object has no attribute 'getvalue'
+    # ------------------------------------------------------------------
+    try:
+        from pptx_merger import Merger
+    except ImportError as exc:
+        raise RuntimeError(
+            "PPTX merge failed using Microsoft PowerPoint COM, and python-pptx-merger is not installed.\n\n"
+            f"PowerPoint/COM error:\n{com_error_text}\n\n"
+            "Install fallback package with:\n"
+            "pip install python-pptx-merger"
+        ) from exc
+
+    try:
+        merger = Merger()
+        merged_doc = merger.merge_slides(normalized_inputs)
+
+        # Some versions return a file path.
+        if isinstance(merged_doc, (str, Path)):
+            merged_path = Path(merged_doc)
+            if merged_path.is_file():
+                shutil.copyfile(str(merged_path), str(output_obj))
+                return
+            raise RuntimeError(f"python-pptx-merger returned a non-file path/string: {merged_doc}")
+
+        # Some versions return BytesIO-like object.
+        if hasattr(merged_doc, "getvalue") and callable(getattr(merged_doc, "getvalue")):
+            data = merged_doc.getvalue()
+        else:
+            data = merged_doc
+
+        if isinstance(data, (bytes, bytearray)):
+            with open(output_obj, "wb") as file:
+                file.write(bytes(data))
+            return
+
+        # Some versions might return a file-like object.
+        if hasattr(data, "read") and callable(getattr(data, "read")):
+            content = data.read()
+            if isinstance(content, (bytes, bytearray)):
+                with open(output_obj, "wb") as file:
+                    file.write(bytes(content))
+                return
+
+        raise RuntimeError(f"Unexpected python-pptx-merger output type: {type(merged_doc)}")
+
+    except Exception as fallback_exc:
+        raise RuntimeError(
+            "PPTX merge failed with both available methods.\n\n"
+            "PowerPoint/COM method failed with:\n"
+            f"{com_error_text}\n\n"
+            "python-pptx-merger fallback failed with:\n"
+            f"{fallback_exc}\n\n"
+            "Recommended fix:\n"
+            "1. Make sure Microsoft PowerPoint is installed.\n"
+            "2. Close all open PowerPoint windows/files.\n"
+            "3. Run the app again; PowerPoint will open briefly during merging."
+        ) from fallback_exc
+
+
+def export_pptx_to_pdf_via_powerpoint(pptx_path: str, pdf_path: str) -> None:
+    """Export PPTX to PDF using Microsoft PowerPoint COM automation."""
+    try:
+        import win32com.client
+    except ImportError as exc:
+        raise RuntimeError(
+            "pywin32 not installed. Run: pip install pywin32\n"
+            "PDF export requires Windows with Microsoft PowerPoint installed."
+        ) from exc
+    ppt = win32com.client.Dispatch("PowerPoint.Application")
+    ppt.Visible = 0
+    presentation = None
+    try:
+        presentation = ppt.Presentations.Open(pptx_path, WithWindow=False)
+        presentation.SaveAs(pdf_path, 32)
+    finally:
+        if presentation is not None:
+            presentation.Close()
+        ppt.Quit()
+
+
+def merge_pdfs(pdf_paths: list[str], output_pdf: str) -> None:
+    """Merge PDFs while preserving page sizes."""
+    try:
+        from pypdf import PdfMerger
+    except ImportError as exc:
+        raise RuntimeError("pypdf not installed. Run: pip install pypdf") from exc
+    os.makedirs(os.path.dirname(output_pdf) or ".", exist_ok=True)
+    merger = PdfMerger()
+    try:
+        for path in pdf_paths:
+            merger.append(path)
+        with open(output_pdf, "wb") as file:
+            merger.write(file)
+    finally:
+        merger.close()
+
+
+def merge_to_pdf_preserve_sizes(input_pptx_paths: list[str], output_pdf: str) -> None:
+    """Convert each PPTX to PDF preserving its slide size, then merge PDFs."""
+    if not input_pptx_paths:
+        raise ValueError("No input files selected.")
+    for path in input_pptx_paths:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Input file not found: {path}")
+        if not path.lower().endswith(".pptx"):
+            raise ValueError(f"Not a PPTX file: {path}")
+    with tempfile.TemporaryDirectory(prefix="pptx_merge_") as tmpdir:
+        pdfs = []
+        for index, pptx_path in enumerate(input_pptx_paths, start=1):
+            pdf_out = os.path.join(tmpdir, f"{index:03d}_{Path(pptx_path).stem}.pdf")
+            export_pptx_to_pdf_via_powerpoint(pptx_path, pdf_out)
+            pdfs.append(pdf_out)
+        merge_pdfs(pdfs, output_pdf)
+
+
+class PptxPdfMergerSection(QWidget):
+    def __init__(self, state: Any | None = None, external_log_box: QTextEdit | None = None):
+        super().__init__()
+        self.state = state
+        self.external_log_box = external_log_box
+        self.output_path: str | None = None
+        self._build_ui()
+        self._apply_default_output_folder()
+        self._refresh_output_preview()
+
+    def _app_run_folder(self) -> Path:
+        return Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+
+    def _default_output_folder(self) -> Path:
+        state_folder = None
+        if self.state is not None:
+            state_folder = (
+                getattr(self.state, "tab2_section1_pptx_pdf_merger_folder", None)
+                or getattr(self.state, "tab2_pptx_pdf_merger_folder", None)
+            )
+        if state_folder:
+            folder = Path(state_folder)
+        else:
+            output_root = getattr(self.state, "output_root", None) if self.state is not None else None
+            folder = (Path(output_root) if output_root else self._app_run_folder() / "output") / "01_pptx_pdf_merger"
+        folder.mkdir(parents=True, exist_ok=True)
+        if self.state is not None:
+            setattr(self.state, "tab2_section1_pptx_pdf_merger_folder", folder)
+            setattr(self.state, "tab2_pptx_pdf_merger_folder", folder)
+        return folder
+
+    def _apply_default_output_folder(self):
+        if not self.output_folder_edit.text().strip():
+            self.output_folder_edit.setText(str(self._default_output_folder()))
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        title = QLabel("PPTX / PDF Merger")
+        title.setStyleSheet("font-weight: bold; font-size: 18px;")
+        desc = QLabel(
+            "Section 1: Add PPTX files, reorder them, then create either a merged PPTX or merged PDF. "
+            "PDF mode preserves each source deck size. PPTX mode creates one deck with one slide size."
+        )
+        desc.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(desc)
+
+        mode_group = QGroupBox("1. Output Type")
+        mode_row = QHBoxLayout(mode_group)
+        self.rb_pptx = QRadioButton("Merged PPTX - single slide size")
+        self.rb_pdf = QRadioButton("Merged PDF - preserve each deck size")
+        self.rb_pdf.setChecked(True)
+        self.mode_button_group = QButtonGroup(self)
+        self.mode_button_group.addButton(self.rb_pptx)
+        self.mode_button_group.addButton(self.rb_pdf)
+        mode_row.addWidget(QLabel("Output Type:"))
+        mode_row.addWidget(self.rb_pptx)
+        mode_row.addWidget(self.rb_pdf)
+        mode_row.addStretch(1)
+        layout.addWidget(mode_group)
+
+        files_group = QGroupBox("2. Input PPTX Files")
+        files_layout = QHBoxLayout(files_group)
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        files_layout.addWidget(self.list_widget, stretch=1)
+        btn_col = QVBoxLayout()
+        self.btn_add = QPushButton("Add PPTX...")
+        self.btn_remove = QPushButton("Remove Selected")
+        self.btn_up = QPushButton("Move Up")
+        self.btn_down = QPushButton("Move Down")
+        self.btn_clear = QPushButton("Clear List")
+        btn_col.addWidget(self.btn_add)
+        btn_col.addWidget(self.btn_remove)
+        btn_col.addSpacing(10)
+        btn_col.addWidget(self.btn_up)
+        btn_col.addWidget(self.btn_down)
+        btn_col.addSpacing(10)
+        btn_col.addWidget(self.btn_clear)
+        btn_col.addStretch(1)
+        files_layout.addLayout(btn_col)
+        layout.addWidget(files_group)
+
+        output_group = QGroupBox("3. Output Root / Save Folder")
+        output_layout = QVBoxLayout(output_group)
+        folder_row = QHBoxLayout()
+        self.output_folder_edit = QLineEdit()
+        self.btn_output_folder = QPushButton("Browse Output Folder...")
+        folder_row.addWidget(QLabel("Output Folder:"))
+        folder_row.addWidget(self.output_folder_edit)
+        folder_row.addWidget(self.btn_output_folder)
+        output_layout.addLayout(folder_row)
+        name_row = QHBoxLayout()
+        self.output_name_edit = QLineEdit("merged")
+        name_row.addWidget(QLabel("Output File Name:"))
+        name_row.addWidget(self.output_name_edit)
+        output_layout.addLayout(name_row)
+        self.output_label = QLabel("Output: (auto)")
+        self.output_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        output_layout.addWidget(self.output_label)
+        layout.addWidget(output_group)
+
+        progress_group = QGroupBox("Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        self.status = QLabel("Idle")
+        self.status.setWordWrap(True)
+        progress_layout.addWidget(self.status)
+        layout.addWidget(progress_group)
+
+        run_row = QHBoxLayout()
+        run_row.addStretch(1)
+        self.btn_merge = QPushButton("Merge")
+        self.btn_merge.setDefault(True)
+        run_row.addWidget(self.btn_merge)
+        layout.addLayout(run_row)
+        layout.addStretch(1)
+
+        self.btn_add.clicked.connect(self.add_files)
+        self.btn_remove.clicked.connect(self.remove_selected)
+        self.btn_up.clicked.connect(lambda: self.move_selected(-1))
+        self.btn_down.clicked.connect(lambda: self.move_selected(1))
+        self.btn_clear.clicked.connect(self.clear_list)
+        self.btn_output_folder.clicked.connect(self.choose_output_folder)
+        self.btn_merge.clicked.connect(self.merge)
+        self.rb_pptx.toggled.connect(self._refresh_output_preview)
+        self.rb_pdf.toggled.connect(self._refresh_output_preview)
+        self.output_folder_edit.textChanged.connect(self._refresh_output_preview)
+        self.output_name_edit.textChanged.connect(self._refresh_output_preview)
+
+    def log(self, message):
+        if self.external_log_box is not None:
+            self.external_log_box.append(str(message))
+            self.external_log_box.ensureCursorVisible()
+
+    def _current_extension(self) -> str:
+        return ".pdf" if self.rb_pdf.isChecked() else ".pptx"
+
+    def _build_output_path(self) -> Path | None:
+        folder_text = self.output_folder_edit.text().strip()
+        name_text = self.output_name_edit.text().strip() or "merged"
+        if not folder_text:
+            return None
+        output_folder = Path(folder_text)
+        suffix = self._current_extension()
+        if not name_text.lower().endswith(suffix):
+            name_text += suffix
+        return output_folder / name_text
+
+    def _refresh_output_preview(self):
+        output_path = self._build_output_path()
+        if output_path:
+            self.output_path = str(output_path)
+            self.output_label.setText(f"Output: {output_path}")
+        else:
+            self.output_path = None
+            self.output_label.setText("Output: (not selected)")
+
+    def choose_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select PPTX/PDF Merger Output Folder",
+            self.output_folder_edit.text().strip() or str(self._default_output_folder()),
+        )
+        if folder:
+            self.output_folder_edit.setText(folder)
+            if self.state is not None:
+                setattr(self.state, "tab2_section1_pptx_pdf_merger_folder", Path(folder))
+                setattr(self.state, "tab2_pptx_pdf_merger_folder", Path(folder))
+            self.status.setText("Output folder selected.")
+            self.log(f"Output folder selected: {folder}")
+            self._refresh_output_preview()
+
+    def add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Select PPTX files", str(Path.home()), "PowerPoint (*.pptx)")
+        if not files:
+            return
+        existing = set(self.get_all_paths())
+        added = 0
+        for file_path in files:
+            if file_path not in existing:
+                self.list_widget.addItem(QListWidgetItem(file_path))
+                existing.add(file_path)
+                added += 1
+        self.status.setText(f"Added {added} file(s).")
+        self.log(f"Added {added} file(s).")
+
+    def remove_selected(self):
+        items = self.list_widget.selectedItems()
+        if not items:
+            return
+        for item in sorted(items, key=self.list_widget.row, reverse=True):
+            self.list_widget.takeItem(self.list_widget.row(item))
+        self.status.setText("Removed selected item(s).")
+        self.log("Removed selected item(s).")
+
+    def clear_list(self):
+        self.list_widget.clear()
+        self.status.setText("Cleared list.")
+        self.log("Cleared list.")
+
+    def move_selected(self, direction: int):
+        selected_rows = sorted({self.list_widget.row(item) for item in self.list_widget.selectedItems()})
+        if not selected_rows:
+            return
+        if direction < 0:
+            for row in selected_rows:
+                if row == 0:
+                    continue
+                item = self.list_widget.takeItem(row)
+                self.list_widget.insertItem(row - 1, item)
+                item.setSelected(True)
+        else:
+            for row in reversed(selected_rows):
+                if row == self.list_widget.count() - 1:
+                    continue
+                item = self.list_widget.takeItem(row)
+                self.list_widget.insertItem(row + 1, item)
+                item.setSelected(True)
+
+    def get_all_paths(self) -> list[str]:
+        return [self.list_widget.item(index).text() for index in range(self.list_widget.count())]
+
+    def merge(self):
+        inputs = self.get_all_paths()
+        self._refresh_output_preview()
+        if not inputs:
+            QMessageBox.warning(self, "No inputs", "Please add at least one PPTX file.")
+            return
+        if not self.output_path:
+            QMessageBox.warning(self, "No output folder", "Please select an output folder.")
+            return
+        try:
+            output_path = Path(self.output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            self.status.setText("Merging...")
+            self.log(f"Merging started. Output: {output_path}")
+            QApplication.processEvents()
+            if self.rb_pdf.isChecked():
+                merge_to_pdf_preserve_sizes(inputs, str(output_path))
+            else:
+                merge_pptx_files(inputs, str(output_path))
+            self.status.setText("Merge completed successfully.")
+            self.log(f"Merge completed successfully: {output_path}")
+            QMessageBox.information(self, "Done", f"Merged {len(inputs)} file(s) into:\n{output_path}")
+        except Exception as exc:
+            self.status.setText("Merge failed.")
+            self.log(f"Merge failed: {exc}")
+            QMessageBox.critical(self, "Merge failed", str(exc))
+
+
+# =========================================================
+# Final 6-section GUI override after adding PPTX/PDF Merger
+# =========================================================
+def _combined6_build_ui(self):
+    self.setWindowTitle("Combined Fund Page Automation")
+    root = QVBoxLayout(self)
+    root.setContentsMargins(6, 6, 6, 6)
+    root.setSpacing(8)
+
+    title = QLabel("Fund Pages Automation")
+    title.setStyleSheet("font-weight: bold; font-size: 18px;")
+    desc = QLabel(
+        "Section 1: PPTX/PDF Merger. "
+        "Section 2: Age-Based Fund Page Notes. "
+        "Section 3: Manual Fund Page Note. "
+        "Section 4: Exit Load Formatter. "
+        "Section 5: Sector Allocation Automation. "
+        "Section 6: Gold and Silver ETF Portfolio."
+    )
+    desc.setWordWrap(True)
+    root.addWidget(title)
+    root.addWidget(desc)
+
+    self.section_tabs = QTabWidget()
+    root.addWidget(self.section_tabs, stretch=1)
+
+    self.merge_log_box = QTextEdit()
+    self.section_tabs.addTab(
+        self._build_tab5_style_section_tab(self.merge_log_box, self.merge_log_box.clear, PptxPdfMergerSection(self.state, self.merge_log_box)),
+        "Section 1 - PPTX/PDF Merger",
+    )
+
+    self.age_log_box = QTextEdit()
+    self.section_tabs.addTab(
+        self._build_tab5_style_section_tab(self.age_log_box, self.age_log_box.clear, self._build_age_based_section()),
+        "Section 2 - Age-Based Notes",
+    )
+
+    self.manual_log_box = QTextEdit()
+    self.section_tabs.addTab(
+        self._build_tab5_style_section_tab(self.manual_log_box, self.manual_log_box.clear, self._build_manual_section()),
+        "Section 3 - Manual Note",
+    )
+
+    self.exitload_log_box = QTextEdit()
+    self.section_tabs.addTab(
+        self._build_tab5_style_section_tab(self.exitload_log_box, self.exitload_log_box.clear, ExitLoadSourceFolderSection(self.state, self.exitload_log_box)),
+        "Section 4 - Exit Load",
+    )
+
+    self.sector_log_box = QTextEdit()
+    self.section_tabs.addTab(
+        self._build_tab5_style_section_tab(self.sector_log_box, self.sector_log_box.clear, SectorAllocationSection(self.state, self.sector_log_box)),
+        "Section 5 - Sector Allocation",
+    )
+
+    self.gold_silver_log_box = QTextEdit()
+    self.section_tabs.addTab(
+        self._build_tab5_style_section_tab(self.gold_silver_log_box, self.gold_silver_log_box.clear, GoldSilverETFSection(self.state, self.gold_silver_log_box)),
+        "Section 6 - Gold/Silver ETF",
+    )
+
+    self.log_box = self.merge_log_box
+
+
+def _combined6_log(self, text: str) -> None:
+    message = str(text)
+    targets = []
+    if hasattr(self, "section_tabs"):
+        idx = self.section_tabs.currentIndex()
+        if idx == 0 and hasattr(self, "merge_log_box"):
+            targets.append(self.merge_log_box)
+        elif idx == 1 and hasattr(self, "age_log_box"):
+            targets.append(self.age_log_box)
+        elif idx == 2 and hasattr(self, "manual_log_box"):
+            targets.append(self.manual_log_box)
+        elif idx == 3 and hasattr(self, "exitload_log_box"):
+            targets.append(self.exitload_log_box)
+        elif idx == 4 and hasattr(self, "sector_log_box"):
+            targets.append(self.sector_log_box)
+        elif idx == 5 and hasattr(self, "gold_silver_log_box"):
+            targets.append(self.gold_silver_log_box)
+    if not targets and hasattr(self, "log_box"):
+        targets.append(self.log_box)
+    for box in targets:
+        box.append(message)
+        box.ensureCursorVisible()
+
+
+CombinedFundPageNotesWindow._build_ui = _combined6_build_ui
+CombinedFundPageNotesWindow.log = _combined6_log
+PptxPdfMergerSectionWidget = PptxPdfMergerSection
+
+Tab2Widget = CombinedFundPageNotesWindow
+
+
+def main():
+    app = QApplication(sys.argv)
+    window = CombinedFundPageNotesWindow()
+    window.resize(1435, 850)
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
